@@ -7,15 +7,14 @@ LAS / LAZ Toolkit  (TerraScan / TerraModeler / Spatix)  -- v2
 Aplicativo único (PySide6) que reúne:
 
     1. Metadados          - nome da folha e nº de pontos (lê só o cabeçalho)
-    2. Renomear           - .las <-> .laz (somente a extensão)
-    3. Editar PRJ         - troca .las/.laz dentro de projetos PRJ (com backup)
-    4. Copiador PRJ       - copia os arquivos listados em um PRJ
-    5. .LAZ -> .laz       - corrige extensão maiúscula
-    6. Converter 1.4->1.2 - LAS/LAZ 1.4 (inclui COPC) para 1.2
-    7. Pontos-Chave (LAS) - equivalente à macro FnScanClassifyModelKey
-    8. GeoTIFF (Lattice)  - equivalente ao "Export Lattice Model"
-    9. Curvas de Nível    - equivalente ao "Produce contours"
-   10. Visualizador 3D    - nuvem LAZ ou MDT (GeoTIFF) colorido por cota, estilo QTM
+    2. Editar PRJ         - troca .las/.laz dentro de projetos PRJ (com backup)
+    3. Copiador PRJ       - copia os arquivos listados em um PRJ
+    4. .LAZ -> .laz       - corrige extensão maiúscula
+    5. Converter Versão   - conversão bidirecional LAS/LAZ 1.4 ↔ 1.2
+    6. Conversor LAS → LAZ- conversão e compressão inteligente em streaming com relatório CSV
+    7. Exportar Classes   - reclassificação e filtro de classes (macros TerraScan)
+    8. Pontos-Chave (LAS) - equivalente à macro FnScanClassifyModelKey
+    9. GeoTIFF (Lattice)  - equivalente ao "Export Lattice Model" 
                             (requer: pip install pyvista matplotlib)
 
 Melhorias da v2:
@@ -37,7 +36,6 @@ Dependências: veja requirements.txt
 from __future__ import annotations
 
 import csv
-import ctypes
 import html as _html
 import importlib.util
 import multiprocessing
@@ -63,6 +61,11 @@ import numpy as np
 if sys.platform == "win32" and getattr(sys, "frozen", False):
     _base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     _dlls = [_base, os.path.join(_base, "PySide6")]
+    for _root, _dirs, _ in os.walk(_base):
+        for _d in _dirs:
+            if _d.endswith(".libs") or _d in ("PySide6", "rasterio", "pyproj", "shapely", "scipy"):
+                _dlls.append(os.path.join(_root, _d))
+    _dlls = list(dict.fromkeys(_dlls))
     os.environ["PATH"] = os.pathsep.join(_dlls) + os.pathsep + os.environ.get("PATH", "")
     for _d in _dlls:
         if os.path.isdir(_d):
@@ -71,16 +74,27 @@ if sys.platform == "win32" and getattr(sys, "frozen", False):
             except Exception:
                 pass
 
-    # Qt6Core imports the unversioned ICU API (for example, ``ucnv_open``).
-    # PyInstaller can otherwise collect an unrelated, version-suffixed ICU
-    # from another package in the build environment. Bind Windows' ICU first
-    # so the loader resolves ``icuuc.dll`` to the matching system runtime.
-    _system_icu = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "icuuc.dll")
-    if os.path.isfile(_system_icu):
-        _icu_handle = ctypes.WinDLL(_system_icu, winmode=0x00001100)
+    for _proj in [
+        os.path.join(_base, "pyproj", "proj_dir", "share", "proj"),
+        os.path.join(_base, "share", "proj"),
+        os.path.join(_base, "proj_data"),
+    ]:
+        if os.path.isdir(_proj):
+            os.environ.setdefault("PROJ_DATA", _proj)
+            os.environ.setdefault("PROJ_LIB", _proj)
+            break
 
-from PySide6.QtCore import Qt, QObject, QThread, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QTextCharFormat, QTextCursor
+    for _gdal in [
+        os.path.join(_base, "rasterio", "gdal_data"),
+        os.path.join(_base, "share", "gdal"),
+        os.path.join(_base, "gdal_data"),
+    ]:
+        if os.path.isdir(_gdal):
+            os.environ.setdefault("GDAL_DATA", _gdal)
+            break
+
+from PySide6.QtCore import Qt, QObject, QThread, QTimer, Signal, QUrl, QSettings
+from PySide6.QtGui import QColor, QFontDatabase, QTextCharFormat, QTextCursor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -89,6 +103,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
+    QListWidgetItem,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -119,25 +135,29 @@ from PySide6.QtWidgets import (
 # --------------------------------------------------------------------------
 try:
     import laspy
+    try:
+        from laspy.compression import LazBackend
+    except Exception:
+        LazBackend = getattr(laspy, "LazBackend", None)
     LASPY_AVAILABLE = True
 except ImportError:
     laspy = None  # type: ignore
+    LazBackend = None
     LASPY_AVAILABLE = False
 
 try:
+    import scipy
     from scipy.spatial import Delaunay, cKDTree
     import rasterio
     import rasterio.io
     import rasterio.windows
     from rasterio.transform import from_origin
     from rasterio.merge import merge as rasterio_merge
-    from shapely.geometry import box, LineString, Polygon
+    from shapely.geometry import box
     from shapely.strtree import STRtree
-    from skimage import measure as skimage_measure
-    import geopandas as gpd
     GEO_AVAILABLE = True
     GEO_IMPORT_ERROR = ""
-except ImportError as _exc:  # pragma: no cover
+except Exception as _exc:  # pragma: no cover
     GEO_AVAILABLE = False
     GEO_IMPORT_ERROR = str(_exc)
 
@@ -248,23 +268,6 @@ def work_metadata(files, emit):
     emit("done")
 
 
-# ── 2. Renomear ───────────────────────────────────────────────────────────
-def work_rename(files, target_ext, emit):
-    ok = erros = 0
-    for i, src in enumerate(files):
-        dst = src.with_suffix(target_ext)
-        try:
-            if dst.exists():
-                raise FileExistsError(f"destino já existe: {dst.name}")
-            src.rename(dst)
-            emit("file", str(src), str(dst), True)
-            ok += 1
-        except Exception as e:
-            emit("file", str(src), str(e), False)
-            erros += 1
-        emit("progress", i + 1)
-    emit("done", ok, erros)
-
 
 # ── 5. .LAZ -> .laz ───────────────────────────────────────────────────────
 def work_lowercase_laz(files, emit):
@@ -363,25 +366,26 @@ def work_copy(entries, src_folder, dest_folder, emit):
 
 
 # ── 6. Conversão LAS/LAZ 1.4 -> 1.2 ───────────────────────────────────────
-# Formatos LAS 1.4 válidos: 0..10. Formatos 4/5 e 9/10 contêm waveform,
-# que não existe nos formatos permitidos pelo LAS 1.2. NIR também não cabe.
-# Mapeamento explícito evita degradar silenciosamente os formatos 0..5 para 3.
-POINT_FORMAT_DOWNGRADE = {
-    0: 0, 1: 1, 2: 2, 3: 3,
-    4: 1, 5: 3,
-    6: 1, 7: 3, 8: 3, 9: 1, 10: 3,
-}
+# 6->1, 7->3, 8->3 (perde NIR), 9->1 (perde waveform), 10->3 (perde NIR e waveform)
+POINT_FORMAT_DOWNGRADE = {6: 1, 7: 3, 8: 3, 9: 1, 10: 3}
+POINT_FORMAT_UPGRADE = {0: 6, 1: 6, 2: 7, 3: 7, 4: 9, 5: 10}
+
+
+def _eh_copc(vlr):
+    uid = str(getattr(vlr, "user_id", "")).strip().lower()
+    desc = str(getattr(vlr, "description", "")).strip().lower()
+    record_id = getattr(vlr, "record_id", None)
+    return uid == "copc" or "copc" in uid or "copc" in desc or (uid == "entwine" and record_id == 1)
 
 
 def _is_copc(las):
     try:
-        for vlr in las.header.vlrs:
-            if getattr(vlr, "user_id", "").strip().lower() == "copc":
+        for vlr in getattr(las.header, "vlrs", []):
+            if _eh_copc(vlr):
                 return True
-        if las.header.evlrs:
-            for vlr in las.header.evlrs:
-                if getattr(vlr, "user_id", "").strip().lower() == "copc":
-                    return True
+        for vlr in getattr(las.header, "evlrs", []) or []:
+            if _eh_copc(vlr):
+                return True
     except Exception:
         pass
     return False
@@ -391,178 +395,431 @@ def _strip_copc(las):
     def _sem_copc(vlrs):
         if not vlrs:
             return vlrs
-        restantes = [v for v in vlrs if getattr(v, "user_id", "").strip().lower() != "copc"]
+        restantes = [v for v in vlrs if not _eh_copc(v)]
         return type(vlrs)(restantes)
     las.header.vlrs = _sem_copc(las.header.vlrs)
-    las.header.evlrs = _sem_copc(las.header.evlrs)
+    if hasattr(las.header, "evlrs") and las.header.evlrs:
+        las.header.evlrs = _sem_copc(las.header.evlrs)
+
+
+def _get_raw_classes(points) -> np.ndarray:
+    rec = getattr(points, "points", points)
+    arr = getattr(rec, "array", None)
+    if arr is not None and "raw_classification" in (arr.dtype.names or ()):
+        return np.asarray(arr["raw_classification"], dtype=np.uint8)
+    return np.asarray(points.classification, dtype=np.uint8)
+
+
+def _set_raw_classes(points, values: np.ndarray) -> None:
+    values = np.asarray(values, dtype=np.uint8)
+    rec = getattr(points, "points", points)
+    arr = getattr(rec, "array", None)
+    if arr is not None and "raw_classification" in (arr.dtype.names or ()):
+        arr["raw_classification"] = values
+    else:
+        try:
+            points.classification = values
+        except Exception:
+            if np.any(values > 31):
+                points.classification = np.minimum(values, 31)
+            else:
+                points.classification = values
 
 
 def _set_raw_classification_byte(las, values):
     """Grava o byte INTEIRO de classificação do LAS 1.2 (como Global Mapper/TerraScan),
     permitindo classes de 0 a 255 em vez do limite de 31 (5 bits) do padrão."""
     values = np.asarray(values, dtype=np.uint8)
-    arr = las.points.array
-    if "raw_classification" in (arr.dtype.names or ()):
+    rec = getattr(las, "points", las)
+    arr = getattr(rec, "array", None)
+    if arr is not None and "raw_classification" in (arr.dtype.names or ()):
         arr["raw_classification"] = values
         return True
     try:
-        las.points["raw_classification"] = values
+        rec["raw_classification"] = values
         return True
     except Exception:
         return False
 
 
-def work_downgrade(files, dest_folder, add_suffix, emit):
+
+def work_convert_version(files, dest_folder, mode, add_suffix, emit):
+    """
+    Converte arquivos LAS/LAZ entre versões:
+      - mode == '1.4->1.2': Downgrade para LAS 1.2 (compatível com softwares legados/TerraScan)
+      - mode == '1.2->1.4': Upgrade para LAS 1.4 (modernização, 256 classes nativas, precisão 0.006°)
+    """
     ok = erros = 0
+    is_downgrade = (mode == "1.4->1.2")
+
     for i, src in enumerate(files):
         try:
             las = laspy.read(str(src), laz_backend=_laz_backends() or None) \
                 if src.suffix.lower() == ".laz" else laspy.read(str(src))
             versao = las.header.version
-            if not (versao.major == 1 and versao.minor == 4):
-                emit("file", src.name, False,
-                     f"ignorado — versão atual é {versao.major}.{versao.minor}, não 1.4")
-                erros += 1
-                emit("progress", i + 1)
-                continue
 
-            era_copc = _is_copc(las)
-            if era_copc:
-                _strip_copc(las)
+            if is_downgrade:
+                if not (versao.major == 1 and versao.minor == 4):
+                    emit("file", src.name, False,
+                         f"ignorado — versão atual é {versao.major}.{versao.minor}, esperado 1.4")
+                    erros += 1
+                    emit("progress", i + 1)
+                    continue
 
-            origem_pf = las.header.point_format.id
-            if origem_pf not in POINT_FORMAT_DOWNGRADE:
-                raise ValueError(
-                    f"Point format {origem_pf} não é suportado para conversão LAS 1.2. "
-                    "Nenhum arquivo de saída foi gravado."
-                )
-            destino_pf = POINT_FORMAT_DOWNGRADE[origem_pf]
+                era_copc = _is_copc(las)
+                if era_copc:
+                    _strip_copc(las)
 
-            try:
-                crs = las.header.parse_crs()
-            except Exception:
-                crs = None
-            evlrs_origem = las.header.evlrs or []
-            evlrs_projection = [
-                vlr for vlr in evlrs_origem
-                if str(getattr(vlr, "user_id", "")).strip().lower() == "lasf_projection"
-            ]
-            evlrs_adicionais = [
-                vlr for vlr in evlrs_origem
-                if str(getattr(vlr, "user_id", "")).strip().lower()
-                not in ("copc", "lasf_projection")
-            ]
-            if crs is None and evlrs_projection:
-                raise RuntimeError(
-                    "Há metadados de CRS em EVLR que não puderam ser interpretados. "
-                    "A conversão foi cancelada para não remover a referência espacial."
-                )
+                origem_pf = las.header.point_format.id
+                destino_pf = POINT_FORMAT_DOWNGRADE.get(origem_pf, origem_pf if origem_pf in (0, 1, 2, 3) else 3)
 
-            # Classificação: guarda original (8 bits); limita temporariamente a 31
-            # só para o laspy.convert não falhar.
-            classif_orig = np.asarray(las.classification).astype(np.uint8).copy()
-            mask_alta = classif_orig > 31
-            n_class_alta = int(np.count_nonzero(mask_alta))
-            if n_class_alta:
-                las.classification = np.minimum(classif_orig, 31).astype(np.uint8)
-
-            # Return number / number of returns (4 bits → 3 bits)
-            n_ret_overflow = 0
-            for campo in ("return_number", "number_of_returns"):
-                arr = np.asarray(las[campo])
-                m = arr > 7
-                if m.any():
-                    n_ret_overflow += int(np.count_nonzero(m))
-                    las[campo] = np.minimum(arr, 7).astype(np.uint8)
-
-            # Scan angle int16 (0.006°) → scan_angle_rank int8 (graus)
-            try:
-                graus = np.asarray(las.scan_angle, dtype=np.float64) * 0.006
-                scan_rank = np.clip(np.rint(graus), -90, 90).astype(np.int8)
-            except Exception:
-                scan_rank = None
-
-            convertido = laspy.convert(las, point_format_id=destino_pf, file_version="1.2")
-
-            if scan_rank is not None:
                 try:
-                    convertido.scan_angle_rank = scan_rank
+                    crs = las.header.parse_crs()
+                except Exception:
+                    crs = None
+
+                # Classificação: guarda original (8 bits); limita temporariamente a 31
+                # só para o laspy.convert não falhar.
+                classif_orig = _get_raw_classes(las).copy()
+                mask_alta = classif_orig > 31
+                n_class_alta = int(np.count_nonzero(mask_alta))
+                if n_class_alta:
+                    las.classification = np.minimum(classif_orig, 31).astype(np.uint8)
+
+                # Return number / number of returns (4 bits → 3 bits)
+                n_ret_overflow = 0
+                for campo in ("return_number", "number_of_returns"):
+                    try:
+                        arr = np.asarray(las[campo])
+                        m = arr > 7
+                        if m.any():
+                            n_ret_overflow += int(np.count_nonzero(m))
+                            las[campo] = np.minimum(arr, 7).astype(np.uint8)
+                    except Exception:
+                        pass
+
+                # Scan angle int16 (0.006°) → scan_angle_rank int8 (graus)
+                try:
+                    graus = np.asarray(las.scan_angle, dtype=np.float64) * 0.006
+                    scan_rank = np.clip(np.rint(graus), -90, 90).astype(np.int8)
+                except Exception:
+                    scan_rank = None
+
+                convertido = laspy.convert(las, point_format_id=destino_pf, file_version="1.2")
+
+                if scan_rank is not None:
+                    try:
+                        convertido.scan_angle_rank = scan_rank
+                    except Exception:
+                        pass
+
+                # Mantém as classes originais gravando o byte completo
+                classe_mantida = True
+                if n_class_alta:
+                    classe_mantida = _set_raw_classification_byte(convertido, classif_orig)
+
+                if crs is not None:
+                    try:
+                        convertido.header.add_crs(crs)
+                    except Exception:
+                        pass
+
+                if era_copc:
+                    _strip_copc(convertido)
+
+                nome_saida = src.stem + ("_v12" if add_suffix else "") + ".laz"
+                dest_path = Path(dest_folder) / nome_saida
+                try:
+                    if dest_path.resolve() == src.resolve():
+                        emit("file", src.name, False, "ignorado — destino coincide com origem (ative o sufixo _v12 ou escolha outra pasta)")
+                        erros += 1
+                        emit("progress", i + 1)
+                        continue
                 except Exception:
                     pass
 
-            # LAS 1.2 reserva só 5 bits para classificação. Para manter valores
-            # 32..255 como Global Mapper/TerraScan, grava o byte bruto completo.
-            # Como esse uso é uma extensão não padrão, falha em vez de criar uma
-            # saída que anuncie sucesso com as classes silenciosamente limitadas.
-            classe_mantida = True
-            if n_class_alta:
-                names = convertido.points.array.dtype.names or ()
-                if "raw_classification" in names:
-                    raw_atual = np.asarray(convertido.points.array["raw_classification"]).copy()
-                    raw_atual[mask_alta] = classif_orig[mask_alta]
-                    classe_mantida = _set_raw_classification_byte(convertido, raw_atual)
-                else:
-                    classe_mantida = False
-                if not classe_mantida:
-                    raise RuntimeError(
-                        "Não foi possível preservar classes acima de 31 no byte bruto "
-                        "de classificação; a conversão foi cancelada para evitar perda."
-                    )
-
-            if crs is not None:
                 try:
-                    convertido.header.add_crs(crs)
-                except Exception as exc:
-                    raise RuntimeError(f"Não foi possível preservar o CRS: {exc}") from exc
+                    convertido.write(str(dest_path))
+                except NotImplementedError as e:
+                    emit("file", src.name, False, f"ignorado — não foi possível gravar: {e}")
+                    erros += 1
+                    emit("progress", i + 1)
+                    continue
 
-            nome_saida = src.stem + ("_v12" if add_suffix else "") + ".laz"
-            dest_path = Path(dest_folder) / nome_saida
-            if dest_path.resolve() == src.resolve():
-                raise FileExistsError(
-                    "o destino coincide com o arquivo de origem; ative o sufixo _v12 "
-                    "ou escolha outra pasta para manter o original intacto"
-                )
-            if dest_path.exists():
-                raise FileExistsError(f"o arquivo de destino já existe: {dest_path}")
-            try:
-                convertido.write(str(dest_path))
-            except NotImplementedError as e:
-                emit("file", src.name, False, f"ignorado — não foi possível gravar: {e}")
-                erros += 1
-                emit("progress", i + 1)
-                continue
+                perdas = []
+                if origem_pf in (8, 10):
+                    perdas.append("NIR")
+                if origem_pf in (9, 10):
+                    perdas.append("waveform")
+                if era_copc:
+                    perdas.append("indexação COPC/octree")
+                perda_txt = f"  (perdeu: {', '.join(perdas)})" if perdas else ""
 
-            perdas = []
-            if origem_pf in (8, 10):
-                perdas.append("NIR")
-            if origem_pf in (4, 5, 9, 10):
-                perdas.append("waveform")
-            if era_copc:
-                perdas.append("indexação COPC/octree")
-            if evlrs_adicionais:
-                perdas.append(f"{len(evlrs_adicionais)} EVLR(s) adicional(is)")
-            perda_txt = f"  (perdeu: {', '.join(perdas)})" if perdas else ""
+                avisos = []
+                if n_class_alta:
+                    if classe_mantida:
+                        avisos.append(f"{n_class_alta} pts com classe >31 mantidos "
+                                      f"(byte completo, máx. {int(classif_orig.max())})")
+                    else:
+                        avisos.append(f"{n_class_alta} pts com classe >31 NÃO puderam ser mantidos (limitados a 31)")
+                if n_ret_overflow:
+                    avisos.append(f"{n_ret_overflow} valores de retorno limitados a 7")
+                aviso_txt = ("  |  " + "  |  ".join(avisos)) if avisos else ""
 
-            avisos = []
-            if n_class_alta:
-                avisos.append(
-                    f"{n_class_alta} pts com classe >31 mantidos "
-                    f"(byte completo, máx. {int(classif_orig.max())})"
-                )
-            if n_ret_overflow:
-                avisos.append(
-                    f"{n_ret_overflow} valores de retorno (>7) limitados a 7 "
-                    "(limite do LAS 1.2)"
-                )
-            aviso_txt = ("  |  " + "  |  ".join(avisos)) if avisos else ""
+                emit("file", src.name, True,
+                     f"1.4 → 1.2  |  formato {origem_pf} → {destino_pf}{perda_txt}{aviso_txt}")
+                ok += 1
 
-            emit("file", src.name, True,
-                 f"1.4 → 1.2  |  formato {origem_pf} → {destino_pf}{perda_txt}{aviso_txt}")
-            ok += 1
+            else:
+                # Upgrade 1.2 / 1.3 -> 1.4
+                if versao.major == 1 and versao.minor == 4:
+                    emit("file", src.name, False,
+                         f"ignorado — versão atual já é 1.4")
+                    erros += 1
+                    emit("progress", i + 1)
+                    continue
+
+                era_copc = _is_copc(las)
+                if era_copc:
+                    _strip_copc(las)
+
+                origem_pf = las.header.point_format.id
+                destino_pf = POINT_FORMAT_UPGRADE.get(origem_pf, origem_pf if origem_pf in (6, 7, 8, 9, 10) else 6)
+
+                try:
+                    crs = las.header.parse_crs()
+                except Exception:
+                    crs = None
+
+                # Classificação: salva classes originais (byte completo, 0-255)
+                classif_orig = _get_raw_classes(las).copy()
+
+                # Scan angle rank (int8, graus) → scan angle (int16, passos de 0.006°)
+                try:
+                    if hasattr(las, "scan_angle_rank"):
+                        scan_deg = np.asarray(las.scan_angle_rank, dtype=np.float64)
+                        scan_14 = np.clip(np.round(scan_deg / 0.006), -30000, 30000).astype(np.int16)
+                    else:
+                        scan_14 = None
+                except Exception:
+                    scan_14 = None
+
+                convertido = laspy.convert(las, point_format_id=destino_pf, file_version="1.4")
+
+                # No LAS 1.4, classification é campo uint8 nativo com 256 classes
+                try:
+                    convertido.classification = classif_orig
+                except Exception:
+                    pass
+
+                if scan_14 is not None:
+                    try:
+                        convertido.scan_angle = scan_14
+                    except Exception:
+                        pass
+
+                if crs is not None:
+                    try:
+                        convertido.header.add_crs(crs)
+                    except Exception:
+                        pass
+
+                if era_copc:
+                    _strip_copc(convertido)
+
+                nome_saida = src.stem + ("_v14" if add_suffix else "") + ".laz"
+                dest_path = Path(dest_folder) / nome_saida
+                try:
+                    if dest_path.resolve() == src.resolve():
+                        emit("file", src.name, False, "ignorado — destino coincide com origem (ative o sufixo _v14 ou escolha outra pasta)")
+                        erros += 1
+                        emit("progress", i + 1)
+                        continue
+                except Exception:
+                    pass
+
+                try:
+                    convertido.write(str(dest_path))
+                except NotImplementedError as e:
+                    emit("file", src.name, False, f"ignorado — não foi possível gravar: {e}")
+                    erros += 1
+                    emit("progress", i + 1)
+                    continue
+
+                max_c = int(classif_orig.max()) if len(classif_orig) else 0
+                info_c = f"  |  classe máx: {max_c}" if max_c > 31 else ""
+                emit("file", src.name, True,
+                     f"{versao.major}.{versao.minor} → 1.4  |  formato {origem_pf} → {destino_pf}{info_c}")
+                ok += 1
+
         except Exception as e:
             emit("file", src.name, False, str(e))
             erros += 1
         emit("progress", i + 1)
+    emit("done", ok, erros)
+
+
+def work_downgrade(files, dest_folder, add_suffix, emit):
+    return work_convert_version(files, dest_folder, "1.4->1.2", add_suffix, emit)
+
+# ==========================================================================
+#  EXPORTAR E RECLASSIFICAR CLASSES (macros TerraScan FnScanClassifyClass / FnScanOutput)
+# ==========================================================================
+
+def _clean_header_copc(header: laspy.LasHeader) -> laspy.LasHeader:
+    """
+    Remove VLRs/EVLRs de octree exclusivos do COPC para permitir que o laspy
+    grave o arquivo como um LAS/LAZ convencional legível em qualquer software.
+    Preserva CRS, VLRs de projeção, escalas e offsets.
+    """
+    novo = laspy.LasHeader(
+        point_format=header.point_format,
+        version=header.version,
+    )
+    novo.scales = header.scales
+    novo.offsets = header.offsets
+    novo.generating_software = "LAS Toolkit (Python)"
+
+    def _eh_copc(vlr):
+        uid = str(getattr(vlr, "user_id", "")).strip().lower()
+        desc = str(getattr(vlr, "description", "")).strip().lower()
+        record_id = getattr(vlr, "record_id", None)
+        return uid == "copc" or "copc" in uid or "copc" in desc or (uid == "entwine" and record_id == 1)
+
+    for vlr in getattr(header, "vlrs", []):
+        if not _eh_copc(vlr):
+            try:
+                novo.vlrs.append(vlr)
+            except Exception:
+                pass
+
+    if getattr(header, "evlrs", None):
+        for evlr in header.evlrs:
+            if not _eh_copc(evlr):
+                try:
+                    novo.evlrs.append(evlr)
+                except Exception:
+                    pass
+
+    return novo
+
+
+def parse_class_ranges(texto: str) -> list[int]:
+    """Interpreta números e intervalos separados por vírgula (ex.: '0-6,8,11,13-17,63,105-107')."""
+    res = set()
+    for parte in texto.split(","):
+        parte = parte.strip()
+        if not parte:
+            continue
+        if "-" in parte:
+            tokens = parte.split("-")
+            if len(tokens) == 2 and tokens[0].strip().isdigit() and tokens[1].strip().isdigit():
+                ini, fim = int(tokens[0]), int(tokens[1])
+                res.update(range(min(ini, fim), max(ini, fim) + 1))
+        elif parte.isdigit():
+            res.add(int(parte))
+    return sorted(res)
+
+
+def parse_terrascan_macro(caminho: Path) -> tuple[list[tuple[int, int]], str]:
+    """Lê um arquivo .mac do TerraScan e extrai regras FnScanClassifyClass e FnScanOutput."""
+    conteudo = caminho.read_text(encoding="utf-8", errors="replace")
+    reclass = [
+        (int(de), int(para))
+        for de, para in re.findall(r"FnScanClassifyClass\s*\(\s*(\d+)\s*,\s*(\d+)", conteudo)
+    ]
+    m = re.search(r'FnScanOutput\s*\(\s*"[^"]*"\s*,\s*"([^"]*)"', conteudo)
+    classes_export = m.group(1).strip() if m else ""
+    return reclass, classes_export
+
+
+def work_export_classes(
+    arquivos: list[Path],
+    pasta_destino: str,
+    reclass_rules: list[tuple[int, int]],
+    classes_export: list[int],
+    formato_saida: str,
+    sufixo: str,
+    emit,
+) -> None:
+    dest_dir = Path(pasta_destino)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Tabela de lookup para reclassificação (0..255)
+    map_class = np.arange(256, dtype=np.uint8)
+    for de, para in reclass_rules:
+        if 0 <= de <= 255 and 0 <= para <= 255:
+            map_class[de] = para
+
+    classes_filtro = set(classes_export) if classes_export else None
+
+    ok = 0
+    erros = 0
+
+    for i, src in enumerate(arquivos):
+        nome = src.name
+        try:
+            if formato_saida == "las":
+                ext = ".las"
+            elif formato_saida == "laz":
+                ext = ".laz"
+            else:
+                ext = src.suffix.lower()
+
+            nome_saida = f"{src.stem}{sufixo}{ext}"
+            dest_path = dest_dir / nome_saida
+
+            if dest_path.resolve() == src.resolve():
+                emit("file", nome, False, "ignorado — destino coincide com origem (adicione um sufixo ou use outra pasta)")
+                erros += 1
+                emit("progress", i + 1)
+                continue
+
+            with _open_reader(src) as reader:
+                header = _clean_header_copc(reader.header)
+                laz_backends = _laz_backends() or None
+
+                is_laz = dest_path.suffix.lower() == ".laz"
+                writer_kw = {"laz_backend": laz_backends} if is_laz else {}
+
+                pts_lidos_arq = 0
+                pts_gravados_arq = 0
+
+                with laspy.open(str(dest_path), mode="w", header=header, **writer_kw) as writer:
+                    for chunk in reader.chunk_iterator(1_000_000):
+                        n_chunk = len(chunk)
+                        pts_lidos_arq += n_chunk
+
+                        # 1. Aplica reclassificação
+                        c_orig = _get_raw_classes(chunk)
+                        c_novo = map_class[c_orig]
+                        _set_raw_classes(chunk, c_novo)
+
+                        # 2. Aplica filtro de exportação
+                        if classes_filtro is not None:
+                            mask = np.isin(c_novo, list(classes_filtro))
+                            if mask.any():
+                                chunk_sel = chunk[mask]
+                                writer.write_points(chunk_sel)
+                                pts_gravados_arq += int(np.count_nonzero(mask))
+                        else:
+                            writer.write_points(chunk)
+                            pts_gravados_arq += n_chunk
+
+            ok += 1
+            emit(
+                "file",
+                nome,
+                True,
+                f"gravado ({pts_gravados_arq:,} de {pts_lidos_arq:,} pontos)",
+            )
+
+        except Exception as exc:
+            erros += 1
+            emit("file", nome, False, f"erro: {exc}")
+
+        emit("progress", i + 1)
+
     emit("done", ok, erros)
 
 
@@ -743,48 +1000,15 @@ def process_block(params: ProcessParams) -> ProcessResult:
 
             las_saida = laspy.LasData(header_saida)
 
-            # As EVLRs não são copiadas para o novo cabeçalho. Recria a definição
-            # de CRS a partir do CRS interpretado, incluindo WKT guardado em EVLR.
-            try:
-                crs_saida = las.header.parse_crs()
-            except Exception:
-                crs_saida = None
-            if crs_saida is not None:
-                try:
-                    las_saida.header.add_crs(crs_saida)
-                except Exception as exc:
-                    raise RuntimeError(f"Não foi possível preservar o CRS: {exc}") from exc
-            else:
-                # Se o CRS não puder ser interpretado, mantém os registros brutos
-                # de projeção que estiverem em EVLR. VLRs de projeção já foram
-                # copiados pelo laço acima.
-                evlrs_origem = getattr(las.header, "evlrs", None)
-                evlrs_crs = [
-                    vlr for vlr in (evlrs_origem or [])
-                    if str(getattr(vlr, "user_id", "")).strip().lower() == "lasf_projection"
-                ]
-                if evlrs_crs:
-                    las_saida.evlrs = type(evlrs_origem)(evlrs_crs)
-
             # Preserva o registro completo dos pontos selecionados.
             las_saida.points = las.points[indices_finais].copy()
 
             # Reclassifica os pontos selecionados como Model Key-point.
-            if params.model_key_class <= 31:
-                las_saida.classification = np.full(
-                    len(indices_finais),
-                    params.model_key_class,
-                    dtype=las_saida.classification.dtype,
-                )
-            else:
-                raw_classification = np.full(
-                    len(indices_finais), params.model_key_class, dtype=np.uint8
-                )
-                if not _set_raw_classification_byte(las_saida, raw_classification):
-                    raise RuntimeError(
-                        "O formato LAS de saída não permite gravar a classe acima de 31 "
-                        "no byte bruto de classificação."
-                    )
+            las_saida.classification = np.full(
+                len(indices_finais),
+                params.model_key_class,
+                dtype=las_saida.classification.dtype,
+            )
 
             las_saida.write(las_path_saida, do_compress=params.saida_laz)
 
@@ -2240,144 +2464,6 @@ class MetadataTab(ToolTab):
         self.log.add("LOG limpo.", "muted")
 
 
-# ==========================================================================
-#  ABA 2 — RENOMEAR ARQUIVOS
-# ==========================================================================
-
-class RenameTab(ToolTab):
-    def __init__(self, status) -> None:
-        super().__init__(status)
-        self.ok = self.err = 0
-        lay = QVBoxLayout(self)
-
-        tb = QHBoxLayout()
-        tb.addWidget(mklabel("CONVERTER PARA:", "sec"))
-        self.rb_laz = QRadioButton(".LAS → .LAZ")
-        self.rb_las = QRadioButton(".LAZ → .LAS")
-        self.rb_laz.setChecked(True)
-        self.rb_laz.toggled.connect(self._refresh)
-        tb.addWidget(self.rb_laz)
-        tb.addWidget(self.rb_las)
-        tb.addSpacing(16)
-        self.btn_add = mkbtn("+ Adicionar", self._add_files)
-        self.btn_dir = mkbtn("Pasta", self._add_folder)
-        self.btn_clr = mkbtn("Limpar", self._clear, "danger")
-        for b in (self.btn_add, self.btn_dir, self.btn_clr):
-            tb.addWidget(b)
-        tb.addStretch(1)
-        lay.addLayout(tb)
-
-        lay.addWidget(mklabel("Arraste e solte arquivos .LAS ou .LAZ aqui", "hint"))
-        self.flist = FileList((".las", ".laz"), fmt=self._fmt)
-        self.flist.dropped.connect(self._after_add)
-        lay.addWidget(self.flist, 1)
-
-        self.stats = Stats([("total", "Total na fila", False), ("las", "Arquivos .LAS", False),
-                            ("laz", "Arquivos .LAZ", False), ("ok", "Renomeados", True),
-                            ("err", "Erros", False)])
-        lay.addWidget(self.stats)
-        lay.addWidget(self.pb)
-
-        bottom = QHBoxLayout()
-        self.btn_rem = mkbtn("Remover selecionados", self._remove_sel)
-        self.btn_run = mkbtn("▶  Renomear arquivos", self._run, "primary")
-        bottom.addWidget(self.btn_rem)
-        bottom.addStretch(1)
-        bottom.addWidget(self.btn_run)
-        lay.addLayout(bottom)
-
-    @property
-    def mode(self) -> str:
-        return ".laz" if self.rb_laz.isChecked() else ".las"
-
-    def _fmt(self, p: Path) -> str:
-        if p.suffix.lower() == self.mode:
-            return f"{p.name}  —  já é {self.mode[1:].upper()}"
-        return f"{p.name}  →  {p.with_suffix(self.mode).name}"
-
-    def _refresh(self) -> None:
-        self.flist.refresh()
-        las = sum(1 for p in self.flist.paths if p.suffix.lower() == ".las")
-        self.stats.set("total", len(self.flist.paths))
-        self.stats.set("las", las)
-        self.stats.set("laz", len(self.flist.paths) - las)
-
-    def _add_files(self) -> None:
-        ps, _ = QFileDialog.getOpenFileNames(
-            self, "Selecionar arquivos", "", "Nuvem de pontos (*.las *.laz *.LAS *.LAZ)")
-        self._add([Path(p) for p in ps])
-
-    def _add_folder(self) -> None:
-        f = QFileDialog.getExistingDirectory(self, "Selecionar pasta")
-        if f:
-            self._add([Path(f)])
-
-    def _add(self, paths) -> None:
-        self._after_add(self.flist.add_paths(paths))
-
-    def _after_add(self, n: int) -> None:
-        if n:
-            self._refresh()
-            self.status(f"{n} arquivo(s) adicionado(s). Total: {len(self.flist.paths)}.")
-
-    def _remove_sel(self) -> None:
-        n = self.flist.remove_selected()
-        self._refresh()
-        self.status(f"{n} item(ns) removido(s).")
-
-    def _clear(self) -> None:
-        self.flist.reset_list()
-        self.stats.reset()
-        self.status("Lista limpa.")
-
-    def _run(self) -> None:
-        mode = self.mode
-        targets = [p for p in self.flist.paths if p.suffix.lower() != mode]
-        if not targets:
-            info(self, "Nada a fazer", f"Todos os arquivos já têm extensão {mode[1:].upper()}.")
-            return
-        if not ask(self, "Confirmar",
-                   f"Renomear {len(targets)} arquivo(s) para {mode[1:].upper()}?\n"
-                   "Esta ação modifica os arquivos no disco."):
-            return
-        self.ok = self.err = 0
-        self.stats.reset("ok", "err")
-        self._start_pb(len(targets))
-        self._busy(True)
-        self.runner.start(work_rename, targets, mode)
-
-    def _on_event(self, kind: str, *a) -> None:
-        if kind == "progress":
-            self.pb.setValue(a[0])
-        elif kind == "file":
-            original, resultado, sucesso = a
-            if sucesso:
-                self.ok += 1
-                self.stats.set("ok", self.ok)
-                orig = Path(original)
-                for i, p in enumerate(self.flist.paths):
-                    if p == orig:
-                        self.flist.paths[i] = Path(resultado)
-                        break
-            else:
-                self.err += 1
-                self.stats.set("err", self.err)
-        elif kind == "done":
-            ok, erros = a
-            self._busy(False)
-            self.pb.setVisible(False)
-            self._refresh()
-            if erros == 0:
-                self.status(f"Concluído — {ok} arquivo(s) renomeado(s).")
-                info(self, "Concluído", f"{ok} arquivo(s) renomeado(s).")
-            else:
-                self.status(f"Concluído com erros — {ok} OK, {erros} erro(s).")
-                warn(self, "Concluído com erros", f"{ok} renomeado(s).\n{erros} com erro.")
-
-    def _busy(self, busy: bool) -> None:
-        set_enabled([self.btn_run, self.btn_add, self.btn_dir, self.btn_clr, self.btn_rem], not busy)
-        self.btn_run.setText("Processando…" if busy else "▶  Renomear arquivos")
-
 
 # ==========================================================================
 #  ABA 3 — EDITAR PRJ
@@ -2878,18 +2964,38 @@ class ConvertVersionTab(ToolTab):
                          "Instale com:  pip install laspy[lazrs]  e reinicie o programa.", "warn")
             lay.addWidget(lb)
 
+        # Seleção de direção de conversão
+        dir_box, dir_lay = card()
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(mklabel("DIREÇÃO DA CONVERSÃO:", "sec"))
+        self.rb_downgrade = QRadioButton("LAS 1.4 → 1.2 (Compatibilidade / TerraScan)")
+        self.rb_upgrade = QRadioButton("LAS 1.2 → 1.4 (Modernização / Padrão Atual)")
+        self.rb_downgrade.setChecked(True)
+        self.rb_downgrade.toggled.connect(self._on_mode_changed)
+        dir_row.addWidget(self.rb_downgrade)
+        dir_row.addWidget(self.rb_upgrade)
+        dir_row.addStretch(1)
+        dir_lay.addLayout(dir_row)
+        lay.addWidget(dir_box)
+
         tb = QHBoxLayout()
-        tb.addWidget(mklabel("ENTRADA (LAZ/LAS 1.4):", "sec"))
+        self.lbl_entrada = mklabel("ENTRADA (LAZ/LAS 1.4):", "sec")
+        tb.addWidget(self.lbl_entrada)
         self.btn_add = mkbtn("+ Adicionar", self._add_files)
         self.btn_dir = mkbtn("Pasta", self._add_folder)
         self.btn_clr = mkbtn("Limpar", self._clear, "danger")
         for b in (self.btn_add, self.btn_dir, self.btn_clr):
             tb.addWidget(b)
+        self.chk_sub = QCheckBox("Incluir subpastas")
+        self.chk_sub.setChecked(False)
+        self.chk_sub.toggled.connect(lambda v: setattr(self.flist, "recursive", v))
+        tb.addWidget(self.chk_sub)
         tb.addStretch(1)
         lay.addLayout(tb)
 
-        lay.addWidget(mklabel("Arraste e solte arquivos .LAZ ou .LAS (versão 1.4) aqui", "hint"))
-        self.flist = FileList((".las", ".laz"))
+        self.lbl_hint = mklabel("Arraste e solte arquivos .LAZ ou .LAS (versão 1.4) aqui", "hint")
+        lay.addWidget(self.lbl_hint)
+        self.flist = FileList((".las", ".laz"), recursive=False)
         self.flist.dropped.connect(self._after_add)
         lay.addWidget(self.flist, 1)
 
@@ -2925,6 +3031,18 @@ class ConvertVersionTab(ToolTab):
         bottom.addStretch(1)
         bottom.addWidget(self.btn_run)
         lay.addLayout(bottom)
+
+    def _on_mode_changed(self) -> None:
+        if self.rb_downgrade.isChecked():
+            self.lbl_entrada.setText("ENTRADA (LAZ/LAS 1.4):")
+            self.lbl_hint.setText("Arraste e solte arquivos .LAZ ou .LAS (versão 1.4) aqui")
+            self.chk.setText("Adicionar sufixo _v12 ao nome do arquivo")
+            self.btn_run.setText("▶  Converter para 1.2")
+        else:
+            self.lbl_entrada.setText("ENTRADA (LAZ/LAS 1.2):")
+            self.lbl_hint.setText("Arraste e solte arquivos .LAZ ou .LAS (versão 1.2 / 1.3) aqui")
+            self.chk.setText("Adicionar sufixo _v14 ao nome do arquivo")
+            self.btn_run.setText("▶  Converter para 1.4")
 
     def _add_files(self) -> None:
         ps, _ = QFileDialog.getOpenFileNames(
@@ -2963,35 +3081,366 @@ class ConvertVersionTab(ToolTab):
 
     def _run(self) -> None:
         if not self.flist.paths:
-            info(self, "Nada a fazer", "Adicione arquivos LAZ/LAS 1.4.")
+            info(self, "Nada a fazer", "Adicione arquivos LAZ/LAS para conversão.")
             return
         if not self.dest.text():
             warn(self, "Atenção", "Selecione a pasta de destino.")
             return
-        if not ask(self, "Confirmar conversão",
-                   f"Converter {len(self.flist.paths)} arquivo(s) de LAZ/LAS 1.4 para 1.2?\n\n"
-                   "Os formatos de ponto serão mapeados explicitamente: 0→0, 1→1, 2→2, 3→3, "
-                   "4→1, 5→3, 6→1, 7→3, 8→3, 9→1, 10→3. "
-                   "NIR (formatos 8 e 10) e waveform (4, 5, 9 e 10) não existem no LAS 1.2 "
-                   "e serão perdidos. Ângulo de varredura será arredondado para graus inteiros; "
-                   "valores de retorno acima de 7 serão limitados a 7; canal do scanner e flag "
-                   "overlap do LAS 1.4 não são representáveis no LAS 1.2. "
-                   "Arquivos COPC são aceitos: a indexação em octree é removida. EVLRs "
-                   "adicionais incompatíveis também serão descartados; o CRS será preservado "
-                   "ou a conversão será interrompida se não puder ser mantido. Nenhum ponto "
-                   "é removido, embora os atributos listados acima possam mudar.\n\n"
-                   "Classificação: valores de 0 a 255, inclusive acima de 31, são mantidos no byte "
-                   "bruto como no Global Mapper/TerraScan. Isso é uma convenção não padrão: leitores "
-                   "estritamente conformes podem interpretar classes acima de 31 como flags do LAS 1.2; "
-                   "nesses pontos, o byte completo da classe tem prioridade sobre essas flags.\n\n"
-                   "Arquivos de origem e destinos existentes não serão sobrescritos."):
+
+        is_downgrade = self.rb_downgrade.isChecked()
+        mode = "1.4->1.2" if is_downgrade else "1.2->1.4"
+        n_arqs = len(self.flist.paths)
+
+        if is_downgrade:
+            msg = (
+                f"Converter {n_arqs} arquivo(s) de LAZ/LAS 1.4 para 1.2?\n\n"
+                "• Arquivos com point format 6-10 terão o formato ajustado "
+                "(6→1, 7→3, 8→3, 9→1, 10→3); NIR e waveform, quando existirem, serão perdidos.\n"
+                "• Arquivos COPC são aceitos: a indexação em octree é removida, mas todos os "
+                "pontos são preservados.\n"
+                "• Classificação: os valores de classe (inclusive acima de 31) são mantidos, "
+                "gravando o byte completo (como Global Mapper e TerraScan fazem).\n"
+                "• Ângulo de varredura: convertido para graus inteiros (-90° a +90°).\n\n"
+                "Os arquivos de origem não são modificados."
+            )
+        else:
+            msg = (
+                f"Converter {n_arqs} arquivo(s) de LAZ/LAS 1.2/1.3 para 1.4?\n\n"
+                "• Formatos serão atualizados para 1.4 (0/1→6, 2/3→7, 4→9, 5→10).\n"
+                "• Formatos 6 e 7 suportam nativamente até 15 retornos por pulso e 256 classes (8 bits).\n"
+                "• Ângulo de varredura: expandido para precisão de 0.006° (int16).\n"
+                "• Classificações originais (inclusive acima de 31) são integralmente mantidas.\n"
+                "• Coordenadas, escalas, offsets e Projeção/CRS são preservados.\n\n"
+                "Os arquivos de origem não são modificados."
+            )
+
+        if not ask(self, "Confirmar conversão", msg):
             return
+
         self.ok = self.err = 0
         self.stats.reset("ok", "err")
         self.log.clear()
         self._start_pb(len(self.flist.paths))
         self._busy(True)
-        self.runner.start(work_downgrade, list(self.flist.paths), self.dest.text(), self.chk.isChecked())
+        self.runner.start(
+            work_convert_version,
+            list(self.flist.paths),
+            self.dest.text(),
+            mode,
+            self.chk.isChecked(),
+        )
+
+    def _on_event(self, kind: str, *a) -> None:
+        if kind == "progress":
+            self.pb.setValue(a[0])
+        elif kind == "file":
+            name, ok, msg = a
+            if ok:
+                self.ok += 1
+                self.stats.set("ok", self.ok)
+                tag, prefix = "ok", "✔"
+            else:
+                self.err += 1
+                self.stats.set("err", self.err)
+                tag, prefix = "err", "✖"
+            self.log.add(f"{prefix}  {name}  —  {msg}", tag)
+        elif kind == "done":
+            ok, erros = a
+            self._busy(False)
+            self.pb.setVisible(False)
+            target_v = "1.2" if self.rb_downgrade.isChecked() else "1.4"
+            if erros == 0:
+                self.status(f"Concluído — {ok} arquivo(s) convertido(s) para {target_v}.")
+                info(self, "Concluído", f"{ok} arquivo(s) convertido(s) para LAZ {target_v}.")
+            else:
+                self.status(f"Concluído com avisos — {ok} sucesso(s), {erros} problema(s).")
+                warn(self, "Atenção",
+                     f"{ok} arquivo(s) convertido(s) para LAZ {target_v}.\n"
+                     f"{erros} arquivo(s) falharam ou foram ignorados. Veja o log.")
+
+
+
+# ==========================================================================
+#  ABA — EXPORTAR CLASSES (TerraScan Macro FnScanClassifyClass / FnScanOutput)
+# ==========================================================================
+
+
+# ==========================================================================
+#  ABA — EXPORTAR CLASSES (TerraScan Macro FnScanClassifyClass / FnScanOutput)
+# ==========================================================================
+
+class ExportClassesTab(ToolTab):
+    def __init__(self, status) -> None:
+        super().__init__(status)
+        self.ok = self.err = 0
+        lay = QVBoxLayout(self)
+
+        if not LASPY_AVAILABLE:
+            lb = mklabel("A biblioteca laspy não está instalada.\\n"
+                         "Instale com:  pip install laspy[lazrs]  e reinicie o programa.", "warn")
+            lay.addWidget(lb)
+
+        tb = QHBoxLayout()
+        tb.addWidget(mklabel("ENTRADA (LAS / LAZ):", "sec"))
+        self.btn_add = mkbtn("+ Adicionar", self._add_files)
+        self.btn_dir = mkbtn("Pasta", self._add_folder)
+        self.btn_clr = mkbtn("Limpar", self._clear, "danger")
+        for b in (self.btn_add, self.btn_dir, self.btn_clr):
+            tb.addWidget(b)
+        self.chk_sub = QCheckBox("Incluir subpastas")
+        self.chk_sub.setChecked(False)
+        self.chk_sub.toggled.connect(lambda v: setattr(self.flist, "recursive", v))
+        tb.addWidget(self.chk_sub)
+        tb.addStretch(1)
+        lay.addLayout(tb)
+
+        lay.addWidget(mklabel("Arraste e solte arquivos .LAS ou .LAZ aqui", "hint"))
+        self.flist = FileList((".las", ".laz"), recursive=False)
+        self.flist.dropped.connect(self._after_add)
+        lay.addWidget(self.flist, 1)
+
+        # Configurações de Macro / Reclassificação / Filtro
+        grp = QGroupBox("Configurações da Macro (Reclassificação e Filtro de Exportação)")
+        gl = QVBoxLayout(grp)
+
+        linha_macro = QHBoxLayout()
+        linha_macro.addWidget(mkbtn("📂 Carregar Macro TerraScan (.mac)...", self._load_macro))
+        linha_macro.addWidget(mkbtn("Preset MDT", self._preset_mdt))
+        linha_macro.addWidget(mkbtn("Preset MDS", self._preset_mds))
+        linha_macro.addStretch(1)
+        gl.addLayout(linha_macro)
+
+        meio = QHBoxLayout()
+
+        # Tabela De -> Para
+        esq_box = QVBoxLayout()
+        esq_box.addWidget(mklabel("Regras de Reclassificação (De → Para):", "sec"))
+        self.tab_reclass = QTableWidget(0, 2)
+        self.tab_reclass.setHorizontalHeaderLabels(["Classe Origem (De)", "Classe Destino (Para)"])
+        self.tab_reclass.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.tab_reclass.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tab_reclass.setFixedHeight(120)
+        esq_box.addWidget(self.tab_reclass)
+
+        btn_reclass_row = QHBoxLayout()
+        btn_reclass_row.addWidget(mkbtn("+ Adicionar Regra", self._add_reclass_row))
+        btn_reclass_row.addWidget(mkbtn("- Remover Regra", self._remove_reclass_row))
+        btn_reclass_row.addWidget(mkbtn("Limpar Regras", self._clear_reclass_rows))
+        btn_reclass_row.addStretch(1)
+        esq_box.addLayout(btn_reclass_row)
+        meio.addLayout(esq_box, 1)
+
+        # Classes a exportar
+        dir_box = QVBoxLayout()
+        dir_box.addWidget(mklabel("Classes para Exportar (Filtro final):", "sec"))
+        self.edit_classes = QLineEdit()
+        self.edit_classes.setPlaceholderText("Ex.: 2  ou  0-6,8,11,13-17,63,105-107 (vazio = todas)")
+        dir_box.addWidget(self.edit_classes)
+
+        dica = mklabel(
+            "Digite as classes finais separadas por vírgula ou faixas com hífen.\\n"
+            "Se deixar em branco, exportará todas as classes existentes.\\n"
+            "Classes acima de 31 (ex: 63, 105, 141) são gravadas integralmente.",
+            "hint",
+        )
+        dica.setWordWrap(True)
+        dir_box.addWidget(dica)
+        dir_box.addStretch(1)
+        meio.addLayout(dir_box, 1)
+
+        gl.addLayout(meio)
+        lay.addWidget(grp)
+
+        # Destino e formato
+        opt, ol = card()
+        r = QHBoxLayout()
+        r.addWidget(mklabel("DESTINO:", "sec"))
+        self.dest = QLineEdit()
+        self.dest.setReadOnly(True)
+        self.btn_dest = mkbtn("Selecionar pasta", self._pick_dest)
+        r.addWidget(self.dest, 1)
+        r.addWidget(self.btn_dest)
+
+        r.addWidget(mklabel("Formato:", "sec"))
+        self.combo_fmt = QComboBox()
+        self.combo_fmt.addItems(["Manter original", ".las", ".laz"])
+        r.addWidget(self.combo_fmt)
+
+        r.addWidget(mklabel("Sufixo no nome:", "sec"))
+        self.edit_sufixo = QLineEdit("_mdt")
+        self.edit_sufixo.setFixedWidth(90)
+        r.addWidget(self.edit_sufixo)
+        ol.addLayout(r)
+        lay.addWidget(opt)
+
+        self.stats = Stats([("total", "Total na fila", False), ("ok", "Exportados", True),
+                            ("err", "Erros", False)])
+        lay.addWidget(self.stats)
+
+        lay.addWidget(mklabel("Log de operações", "hint"))
+        self.log = LogView(90)
+        lay.addWidget(self.log)
+        lay.addWidget(self.pb)
+
+        bottom = QHBoxLayout()
+        self.btn_rem = mkbtn("Remover selecionados", self._remove_sel)
+        self.btn_run = mkbtn("▶  Exportar Classes", self._run, "primary")
+        if not LASPY_AVAILABLE:
+            self.btn_run.setEnabled(False)
+        bottom.addWidget(self.btn_rem)
+        bottom.addStretch(1)
+        bottom.addWidget(self.btn_run)
+        lay.addLayout(bottom)
+
+        # Preset MDT por padrão
+        self._preset_mdt()
+
+    def _add_files(self) -> None:
+        ps, _ = QFileDialog.getOpenFileNames(
+            self, "Selecionar arquivos", "", "Nuvem de pontos (*.las *.laz *.LAS *.LAZ)")
+        self._add([Path(p) for p in ps])
+
+    def _add_folder(self) -> None:
+        f = QFileDialog.getExistingDirectory(self, "Selecionar pasta")
+        if f:
+            self._add([Path(f)])
+
+    def _add(self, paths) -> None:
+        self._after_add(self.flist.add_paths(paths))
+
+    def _after_add(self, n: int) -> None:
+        if n:
+            self.stats.set("total", len(self.flist.paths))
+            self.status(f"{n} arquivo(s) adicionado(s). Total: {len(self.flist.paths)}.")
+
+    def _remove_sel(self) -> None:
+        n = self.flist.remove_selected()
+        self.stats.set("total", len(self.flist.paths))
+        self.status(f"{n} item(ns) removido(s).")
+
+    def _clear(self) -> None:
+        self.flist.reset_list()
+        self.log.clear()
+        self.stats.reset()
+        self.status("Lista limpa.")
+
+    def _pick_dest(self) -> None:
+        f = QFileDialog.getExistingDirectory(self, "Selecionar pasta de destino")
+        if f:
+            self.dest.setText(f)
+            self.status(f"Destino: {f}")
+
+    def _add_reclass_row(self, de: str = "", para: str = "") -> None:
+        r = self.tab_reclass.rowCount()
+        self.tab_reclass.insertRow(r)
+        it_de = QTableWidgetItem(str(de))
+        it_para = QTableWidgetItem(str(para))
+        it_de.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        it_para.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.tab_reclass.setItem(r, 0, it_de)
+        self.tab_reclass.setItem(r, 1, it_para)
+
+    def _remove_reclass_row(self) -> None:
+        rows = sorted([i.row() for i in self.tab_reclass.selectedItems()], reverse=True)
+        for r in rows:
+            self.tab_reclass.removeRow(r)
+
+    def _clear_reclass_rows(self) -> None:
+        self.tab_reclass.setRowCount(0)
+
+    def _get_reclass_rules(self) -> list[tuple[int, int]]:
+        rules = []
+        for r in range(self.tab_reclass.rowCount()):
+            it_de = self.tab_reclass.item(r, 0)
+            it_para = self.tab_reclass.item(r, 1)
+            if it_de and it_para:
+                try:
+                    c_de = int(it_de.text().strip())
+                    c_para = int(it_para.text().strip())
+                    rules.append((c_de, c_para))
+                except ValueError:
+                    pass
+        return rules
+
+    def _preset_mdt(self) -> None:
+        self._clear_reclass_rows()
+        self._add_reclass_row("8", "2")
+        self._add_reclass_row("63", "2")
+        self.edit_classes.setText("2")
+        self.edit_sufixo.setText("_mdt")
+        self.log.add("Preset MDT carregado: reclassifica 8,63→2 e exporta classe 2.", "muted")
+
+    def _preset_mds(self) -> None:
+        self._clear_reclass_rows()
+        self._add_reclass_row("8", "2")
+        self._add_reclass_row("63", "2")
+        self._add_reclass_row("22", "1")
+        self._add_reclass_row("0", "1")
+        self.edit_classes.setText("0-6,8,11,13-17,63,105-107,121-122,141-144")
+        self.edit_sufixo.setText("_mds")
+        self.log.add("Preset MDS carregado: reclassifica 8,63→2, 22,0→1 e exporta classes do MDS.", "muted")
+
+    def _load_macro(self) -> None:
+        cam, _ = QFileDialog.getOpenFileName(
+            self, "Carregar Macro TerraScan", "", "TerraScan Macro (*.mac);;Texto (*.txt);;Todos (*.*)"
+        )
+        if not cam:
+            return
+        try:
+            reclass, classes_export = parse_terrascan_macro(Path(cam))
+            self._clear_reclass_rows()
+            for de, para in reclass:
+                self._add_reclass_row(str(de), str(para))
+            self.edit_classes.setText(classes_export)
+            self.log.add(
+                f"Macro carregada de '{Path(cam).name}': {len(reclass)} regra(s) de reclassificação, "
+                f"classes exportadas: '{classes_export or 'todas'}'.",
+                "ok",
+            )
+        except Exception as exc:
+            warn(self, "Erro", f"Falha ao ler macro: {exc}")
+
+    def _run(self) -> None:
+        if not self.flist.paths:
+            info(self, "Nada a fazer", "Adicione arquivos LAS ou LAZ.")
+            return
+        if not self.dest.text():
+            warn(self, "Atenção", "Selecione a pasta de destino.")
+            return
+
+        reclass_rules = self._get_reclass_rules()
+        texto_classes = self.edit_classes.text().strip()
+        classes_export = parse_class_ranges(texto_classes) if texto_classes else []
+
+        fmt_map = {"Manter original": "original", ".las": "las", ".laz": "laz"}
+        formato = fmt_map.get(self.combo_fmt.currentText(), "original")
+        sufixo = self.edit_sufixo.text().strip()
+
+        msg = (
+            f"Processar {len(self.flist.paths)} arquivo(s)?\\n\\n"
+            f"- Regras de reclassificação: {len(reclass_rules)} regra(s)\\n"
+            f"- Classes a exportar: {texto_classes if texto_classes else 'Todas as classes'}\\n"
+            f"- Pasta de destino: {self.dest.text()}\\n"
+            f"- Formato: {self.combo_fmt.currentText()}\\n\\n"
+            "Os arquivos originais não serão alterados."
+        )
+        if not ask(self, "Confirmar exportação", msg):
+            return
+
+        self.ok = self.err = 0
+        self.stats.reset("ok", "err")
+        self.log.clear()
+        self._start_pb(len(self.flist.paths))
+        self._busy(True)
+        self.runner.start(
+            work_export_classes,
+            list(self.flist.paths),
+            self.dest.text(),
+            reclass_rules,
+            classes_export,
+            formato,
+            sufixo,
+        )
 
     def _on_event(self, kind: str, *a) -> None:
         if kind == "progress":
@@ -3012,20 +3461,22 @@ class ConvertVersionTab(ToolTab):
             self._busy(False)
             self.pb.setVisible(False)
             if erros == 0:
-                self.status(f"Concluído — {ok} arquivo(s) convertido(s) para 1.2.")
-                info(self, "Concluído", f"{ok} arquivo(s) convertido(s) para LAZ 1.2.")
+                self.status(f"Concluído — {ok} arquivo(s) processado(s).")
+                info(self, "Concluído", f"{ok} arquivo(s) exportado(s) com sucesso.")
             else:
                 self.status(f"Concluído com erros — {ok} OK, {erros} erro(s).")
-                warn(self, "Concluído com erros", f"{ok} convertido(s).\n{erros} com erro (veja o log).")
+                warn(self, "Concluído com erros", f"{ok} exportado(s).\\n{erros} com erro (veja o log).")
 
     def _busy(self, busy: bool) -> None:
-        set_enabled([self.btn_run, self.btn_add, self.btn_dir, self.btn_clr, self.btn_dest,
-                     self.btn_rem, self.chk], not busy)
-        self.btn_run.setText("Convertendo…" if busy else "▶  Converter para 1.2")
+        set_enabled([
+            self.btn_run, self.btn_add, self.btn_dir, self.btn_clr, self.btn_dest,
+            self.btn_rem, self.combo_fmt, self.edit_sufixo, self.edit_classes, self.tab_reclass,
+        ], not busy)
+        self.btn_run.setText("Exportando…" if busy else "▶  Exportar Classes")
 
 
 # ==========================================================================
-#  BASE DAS ABAS 7-9 (processamento em lote por pasta)
+#  ABAS DE PROCESSAMENTO GEOESPACIAL (POOL TAB / KEYPOINTS / LATTICE)
 # ==========================================================================
 
 class PoolTab(ToolTab):
@@ -3320,482 +3771,1388 @@ class LatticeTab(PoolTab):
 #  ABA 9 — CURVAS DE NÍVEL (CONTOURS)
 # ==========================================================================
 
-class ContoursTab(PoolTab):
-    HEADERS = ["Folha", "Status", "Pts TIN", "Vizinhos", "Linhas", "Tempo (s)"]
-    SAIDA_LABEL = "Directory (pasta de saída):"
-    SPLIT_SIZES = (460, 360)
-
-    def build_params(self) -> QWidget:
-        self.edit_prefixo = QLineEdit("contours")
-        self.form_pastas.addRow("Name prefix:", self.edit_prefixo)
-
-        wrap = QWidget()
-        wl = QVBoxLayout(wrap)
-        wl.setContentsMargins(0, 0, 0, 0)
-
-        gm = QGroupBox("Model settings")
-        fm = QFormLayout(gm)
-        self.spin_buffer = spin_d(0.0, 100000.0, 200.0)
-        fm.addRow("Model buffer (m ao redor da folha):", self.spin_buffer)
-        self.spin_res = spin_d(0.05, 50.0, 1.0)
-        fm.addRow("Resolução do grid interno (m):", self.spin_res)
-        self.edit_classes = QLineEdit("8")
-        fm.addRow("Laser points -- Classes:", self.edit_classes)
-        self.spin_epsg = spin_i(1000, 99999, 31982)
-        fm.addRow("EPSG da saída vetorial:", self.spin_epsg)
-        self.combo_fmt = QComboBox()
-        self.combo_fmt.addItems(["GPKG", "SHP"])
-        fm.addRow("Formato das curvas:", self.combo_fmt)
-        self.check_continua = QCheckBox("Gerar arquivo único contínuo (sem emendas por folha)")
-        fm.addRow(self.check_continua)
-        self.check_bordas = QCheckBox("Encaixar pontas das curvas nas bordas das folhas")
-        self.check_bordas.setChecked(True)
-        fm.addRow(self.check_bordas)
-        wl.addWidget(gm)
-
-        gc = QGroupBox("Contours")
-        gl = QVBoxLayout(gc)
-        linha_set = QHBoxLayout()
-        linha_set.addWidget(mkbtn("Carregar configurações (.set)...", self.on_carregar_set))
-        linha_set.addStretch(1)
-        gl.addLayout(linha_set)
-
-        cols = QHBoxLayout()
-        esq, dirr = QFormLayout(), QFormLayout()
-        cols.addLayout(esq, 1)
-        cols.addLayout(dirr, 1)
-        gl.addLayout(cols)
-
-        self.check_basic = QCheckBox("Draw basic contours")
-        self.check_basic.setChecked(True)
-        self.spin_basic = spin_d(0.01, 1000.0, 1.0, 3)
-        esq.addRow(self.check_basic, self.spin_basic)
-        self.check_major = QCheckBox("Draw major contours")
-        self.check_major.setChecked(True)
-        self.spin_major = spin_d(0.01, 1000.0, 5.0, 3)
-        esq.addRow(self.check_major, self.spin_major)
-        self.check_minor = QCheckBox("Draw minor contours")
-        self.spin_minor = spin_d(0.01, 1000.0, 0.5, 3)
-        esq.addRow(self.check_minor, self.spin_minor)
-        self.check_smooth = QCheckBox("Smoothing (suavização Chaikin)")
-        self.check_smooth.setChecked(True)
-        esq.addRow(self.check_smooth)
-        self.check_thin = QCheckBox("Thin (simplificar vértices)")
-        self.spin_thin = spin_d(0.001, 100.0, 0.5, 3)
-        esq.addRow(self.check_thin, self.spin_thin)
-        self.spin_proc = spin_i(1, 32, 4)
-        esq.addRow("Processos paralelos:", self.spin_proc)
-
-        self.check_min_area = QCheckBox("Usar área mínima (descarta anéis pequenos)")
-        dirr.addRow(self.check_min_area)
-        self.spin_hill = spin_d(0.0, 1000000.0, 200.0)
-        dirr.addRow("Hill area (m²):", self.spin_hill)
-        self.spin_dep = spin_d(0.0, 1000000.0, 200.0)
-        dirr.addRow("Dep area (m²):", self.spin_dep)
-        self.spin_dec = spin_i(0, 6, 2)
-        dirr.addRow("Casas decimais da cota:", self.spin_dec)
-
-        aviso = mklabel('Obs.: "Survey elements" e "Vector elements" do TerraModeler não são '
-                        "suportados nesta versão -- só pontos LiDAR (Laser points).", "hint")
-        aviso.setWordWrap(True)
-        gl.addWidget(aviso)
-        wl.addWidget(gc)
-        return wrap
-
-    def on_carregar_set(self) -> None:
-        caminho, _ = QFileDialog.getOpenFileName(
-            self, "Carregar configurações de curvas (.set)", "", "TerraModeler settings (*.set)")
-        if not caminho:
-            return
-        try:
-            config = carregar_configuracoes_set(caminho)
-        except Exception as exc:  # noqa: BLE001
-            self.log.add(f"Erro ao ler .set: {exc}", "err")
-            return
-
-        def _float(chave, padrao):
-            try:
-                return float(config.get(chave, padrao))
-            except ValueError:
-                return padrao
-
-        def _bool(chave, padrao):
-            try:
-                return int(config.get(chave, "1" if padrao else "0")) != 0
-            except ValueError:
-                return padrao
-
-        self.spin_basic.setValue(_float("BasicInterval", self.spin_basic.value()))
-        self.spin_major.setValue(_float("MajorInterval", self.spin_major.value()))
-        self.spin_minor.setValue(_float("MinorInterval", self.spin_minor.value()))
-        self.check_basic.setChecked(_bool("DrawBasic", self.check_basic.isChecked()))
-        self.check_major.setChecked(_bool("DrawMajor", self.check_major.isChecked()))
-        self.check_minor.setChecked(_bool("DrawMinor", self.check_minor.isChecked()))
-        self.check_smooth.setChecked(_bool("Smoothing", self.check_smooth.isChecked()))
-        self.check_thin.setChecked(_bool("Thin", self.check_thin.isChecked()))
-        self.spin_thin.setValue(_float("ThinDeviation", self.spin_thin.value()))
-        self.check_min_area.setChecked(_bool("UseMinArea", self.check_min_area.isChecked()))
-        self.spin_hill.setValue(_float("HillArea", self.spin_hill.value()))
-        self.spin_dep.setValue(_float("DepArea", self.spin_dep.value()))
-        try:
-            self.spin_dec.setValue(int(config.get("LabelDecimals", self.spin_dec.value())))
-        except ValueError:
-            pass
-        self.log.add(f"Configurações carregadas de {Path(caminho).name}.", "ok")
-
-    def prepare(self, arquivos, pasta_saida):
-        classes = parse_classes(self.edit_classes.text())
-        if not classes:
-            self.log.add("Erro: informe ao menos uma classe válida (ex.: 8).", "err")
-            return None
-        if not (self.check_basic.isChecked() or self.check_major.isChecked()
-                or self.check_minor.isChecked()):
-            self.log.add("Erro: marque ao menos um tipo de curva (basic/major/minor).", "err")
-            return None
-
-        continua = self.check_continua.isChecked()
-        kw = dict(
-            output_dir=pasta_saida,
-            prefixo=self.edit_prefixo.text().strip() or "contours",
-            classes=classes,
-            resolucao_grid=self.spin_res.value(),
-            draw_basic=self.check_basic.isChecked(),
-            draw_major=self.check_major.isChecked(),
-            draw_minor=self.check_minor.isChecked(),
-            basic_interval=self.spin_basic.value(),
-            major_interval=self.spin_major.value(),
-            minor_interval=self.spin_minor.value(),
-            smoothing=self.check_smooth.isChecked(),
-            thin=self.check_thin.isChecked(),
-            thin_deviation=self.spin_thin.value(),
-            use_min_area=self.check_min_area.isChecked(),
-            hill_area=self.spin_hill.value(),
-            dep_area=self.spin_dep.value(),
-            label_decimals=self.spin_dec.value(),
-            formato_saida=self.combo_fmt.currentText(),
-            ajustar_bordas=self.check_bordas.isChecked(),
-            epsg=self.spin_epsg.value(),
-        )
-        args = (arquivos, self.spin_buffer.value(), kw, continua,
-                self.spin_proc.value(), self.cancel_event)
-        return work_contours, args, (1 if continua else len(arquivos))
-
-    def row_values(self, r: ContourResult) -> list:
-        return [r.n_pontos_tin, r.n_vizinhos_usados, r.n_linhas, f"{r.tempo_s:.1f}"]
-
-    def ok_path(self, r: ContourResult) -> str:
-        return r.curvas_path
 
 
 # ==========================================================================
-#  VISUALIZADOR 3D (estilo Quick Terrain Modeler)
+#  ABA: CONVERSOR LAS/LAZ -> LAZ (STREAMING POR CHUNKS + RELATÓRIO CSV)
 # ==========================================================================
-# Roda em PROCESSO SEPARADO (PyVista/VTK): a janela 3D não trava a interface
-# do toolkit e um problema de OpenGL não derruba o programa.
 
-PYVISTA_AVAILABLE = importlib.util.find_spec("pyvista") is not None
+# ----------------------------- utilitários -----------------------------
+
+def human_bytes(num: Optional[int]) -> str:
+    if num is None:
+        return "-"
+    step = 1024.0
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    n = float(num)
+    for u in units:
+        if n < step:
+            return f"{n:.2f} {u}"
+        n /= step
+    return f"{n:.2f} EB"
+
+
+def now_stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_makedirs(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def open_in_file_manager(path: str) -> None:
+    if not path:
+        return
+    p = path
+    if os.path.isfile(p):
+        p = os.path.dirname(p)
+    if os.path.isdir(p):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(p)))
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+# ----------------------------- widgets -----------------------------
+
+class DropListWidget(QListWidget):
+    """Lista com suporte a drag&drop de arquivos e pastas."""
+
+    def __init__(self, owner=None):
+        super().__init__(owner)
+        self.owner = owner
+        self.setAcceptDrops(True)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setAlternatingRowColors(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        paths = []
+        for u in urls:
+            p = u.toLocalFile()
+            if p:
+                paths.append(p)
+        if self.owner is not None:
+            self.owner.handle_dropped_paths(paths)
+        event.acceptProposedAction()
+
+
+class SmartTable(QTableWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setColumnCount(6)
+        self.setHorizontalHeaderLabels([
+            "Status", "Arquivo", "Pontos", "Versão", "Saída", "Mensagem"
+        ])
+        self.verticalHeader().setVisible(False)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setAlternatingRowColors(True)
+        self.setSortingEnabled(False)
+        header = self.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+
+
+# ----------------------------- dados -----------------------------
+
+@dataclass
+class Job:
+    in_path: str
+    root_for_rel: Optional[str] = None
 
 
 @dataclass
-class ViewerParams:
-    fonte: str                              # "laz" (nuvem) ou "tif" (MDT)
-    paths: list[str]
-    classes: list[int]                      # vazio = todas as classes
-    exagero_z: float = 1.0
-    tamanho_ponto: float = 2.0
-    max_pontos: int = 10_000_000            # orçamento de pontos (nuvem)
-    cmap: str = "jet"                       # azul (baixo) -> vermelho (alto)
-    fundo: str = "black"
-    eye_dome: bool = True                   # realça relevo/profundidade na nuvem
-    png_path: str = ""                      # se preenchido, salva PNG sem abrir janela
-    png_w: int = 1920
-    png_h: int = 1080
+class JobResult:
+    in_path: str
+    out_path: str
+    ok: bool
+    message: str
+    in_size: Optional[int] = None
+    out_size: Optional[int] = None
+    points: Optional[int] = None
+    seconds: Optional[float] = None
+    out_version: Optional[str] = None
+    out_point_format: Optional[int] = None
 
 
-def _carregar_nuvem_view(paths, classes, max_pontos):
-    """Lê as nuvens em chunks, filtra classes e decima aleatoriamente até ~max_pontos."""
-    rng = np.random.default_rng(0)
-    alvo = np.asarray(sorted(set(classes))) if classes else None
-    total = 0
-    for p in paths:
-        with _open_reader(p) as f:
-            total += int(f.header.point_count)
-    frac = min(1.0, max_pontos / max(total, 1))
-
-    partes = []
-    for p in paths:
-        with _open_reader(p) as f:
-            for pts in f.chunk_iterator(1_000_000):
-                x = np.asarray(pts.x)
-                m = np.ones(x.size, dtype=bool) if alvo is None \
-                    else np.isin(np.asarray(pts.classification), alvo)
-                if frac < 1.0:
-                    m &= rng.random(x.size) < frac
-                if m.any():
-                    partes.append(np.column_stack(
-                        [x[m], np.asarray(pts.y)[m], np.asarray(pts.z)[m]]))
-    if not partes:
-        raise RuntimeError("Nenhum ponto encontrado (verifique as classes selecionadas).")
-    return np.concatenate(partes, axis=0)
+class WorkerSignals(QObject):
+    log = Signal(str)
+    overall = Signal(int, int)
+    file_progress = Signal(int, int)
+    current_file = Signal(str)
+    file_result = Signal(object)
+    finished = Signal(list)
+    failed = Signal(str)
 
 
-def _carregar_mdt_view(paths, max_celulas=4_000_000):
-    """Lê/mosaica GeoTIFF(s) e devolve (x, y, z, mascara_valida), decimado se muito grande."""
-    srcs = [rasterio.open(p) for p in paths]
-    try:
-        nodata = srcs[0].nodata
-        arr, transform = rasterio_merge(srcs)
-    finally:
-        for s in srcs:
-            s.close()
-    z = arr[0].astype(np.float64)
-    mask = np.isfinite(z)
-    if nodata is not None:
-        mask &= ~np.isclose(z, nodata)
-    mask &= z > -9000
-    if not mask.any():
-        raise RuntimeError("O GeoTIFF não tem células válidas.")
-    h, w = z.shape
-    passo = max(int(np.ceil(np.sqrt(h * w / max_celulas))), 1)
-    z, mask = z[::passo, ::passo], mask[::passo, ::passo]
-    x = transform.c + (np.arange(w)[::passo] + 0.5) * transform.a
-    y = transform.f + (np.arange(h)[::passo] + 0.5) * transform.e
-    return x, y, z, mask
+# ----------------------------- worker -----------------------------
 
+class LasToLazWorker(QObject):
+    def __init__(
+        self,
+        jobs: List[Job],
+        out_mode: str,
+        out_folder: str,
+        out_subfolder: str,
+        keep_structure: bool,
+        overwrite: bool,
+        verify: bool,
+        move_original: bool,
+        chunk_points: int,
+        read_evlrs: bool,
+        backend_choice: str,
+        target_version_choice: str,
+        signals: WorkerSignals,
+        out_format: str = "LAZ",
+    ):
+        super().__init__()
+        self.jobs = jobs
+        self.out_mode = out_mode
+        self.out_folder = out_folder
+        self.out_subfolder = out_subfolder
+        self.keep_structure = keep_structure
+        self.overwrite = overwrite
+        self.verify = verify
+        self.move_original = move_original
+        self.chunk_points = max(50_000, int(chunk_points))
+        self.read_evlrs = read_evlrs
+        self.backend_choice = backend_choice
+        self.target_version_choice = target_version_choice
+        self.signals = signals
+        self.out_format = out_format
+        self._cancel = False
 
-def _viewer_process(params, fila):
-    """Processo filho: carrega os dados, monta a cena PyVista e abre/salva."""
-    try:
-        import pyvista as pv
+    def cancel(self):
+        self._cancel = True
 
-        salvar = bool(params.png_path)
-        pl = pv.Plotter(off_screen=salvar, window_size=[params.png_w, params.png_h])
-        pl.set_background(params.fundo)
-        cor_texto = "white" if params.fundo in ("black", "darkgray", "gray") else "black"
-        barra = dict(title="Cota (m)", color=cor_texto, vertical=True)
+    def _pick_backend(self):
+        if LazBackend is None:
+            return None
+        available = LazBackend.detect_available()
+        if self.backend_choice == "AUTO":
+            return None
+        mapping = {
+            "LAZRS_PAR": getattr(LazBackend, "LazrsParallel", None),
+            "LAZRS": getattr(LazBackend, "Lazrs", None),
+            "LASZIP": getattr(LazBackend, "Laszip", None),
+        }
+        candidate = mapping.get(self.backend_choice)
+        if candidate in available:
+            return candidate
+        return None
 
-        if params.fonte == "laz":
-            xyz = _carregar_nuvem_view(params.paths, params.classes, params.max_pontos)
-            origem = xyz.min(axis=0)
-            pts = (xyz - origem).astype(np.float32)   # coordenadas locais: evita perda de precisão
-            cota = xyz[:, 2].astype(np.float32)
-            pts[:, 2] *= params.exagero_z
-            nuvem = pv.PolyData(pts)
-            nuvem["Cota (m)"] = cota
-            pl.add_mesh(nuvem, scalars="Cota (m)", cmap=params.cmap,
-                        point_size=params.tamanho_ponto, scalar_bar_args=barra)
-            if params.eye_dome:
+    def _calc_out_path(self, job: Job) -> str:
+        in_path = job.in_path
+        base_name = os.path.splitext(os.path.basename(in_path))[0]
+        ext = ".laz" if getattr(self, "out_format", "LAZ") == "LAZ" else ".las"
+        out_name = base_name + ext
+
+        if self.out_mode == "NEXT_TO_INPUT":
+            out_dir = os.path.dirname(in_path)
+            if self.out_subfolder.strip():
+                out_dir = os.path.join(out_dir, self.out_subfolder.strip())
+            safe_makedirs(out_dir)
+            return os.path.join(out_dir, out_name)
+
+        out_dir = self.out_folder
+        if self.keep_structure and job.root_for_rel:
+            try:
+                rel = os.path.relpath(os.path.dirname(in_path), job.root_for_rel)
+                if rel not in (".", ""):
+                    out_dir = os.path.join(out_dir, rel)
+            except Exception:
+                pass
+        safe_makedirs(out_dir)
+        return os.path.join(out_dir, out_name)
+
+    def _header_summary(self, header) -> str:
+        try:
+            mins = getattr(header, "mins", None)
+            maxs = getattr(header, "maxs", None)
+            bbox = ""
+            if mins is not None and maxs is not None:
+                bbox = f"bbox=({mins[0]:.3f},{mins[1]:.3f},{mins[2]:.3f})..({maxs[0]:.3f},{maxs[1]:.3f},{maxs[2]:.3f})"
+            return f"v{header.version}, fmt={header.point_format.id}, pts={header.point_count}, {bbox}"
+        except Exception:
+            return "header=?"
+
+    def _choose_pf_for_12(self, src_header) -> int:
+        src_dims = set(src_header.point_format.dimension_names)
+        has_rgb = {"red", "green", "blue"}.issubset(src_dims)
+        has_gps = "gps_time" in src_dims
+        if has_rgb and has_gps:
+            return 3
+        if has_rgb:
+            return 2
+        if has_gps:
+            return 1
+        return 0
+
+    def _copy_header_fields(self, src, dst):
+        for attr in [
+            "file_source_id", "system_identifier", "generating_software",
+            "creation_date", "uuid", "global_encoding"
+        ]:
+            try:
+                setattr(dst, attr, getattr(src, attr))
+            except Exception:
+                pass
+        try:
+            dst.scales = np.array(src.scales, dtype=float)
+        except Exception:
+            pass
+        try:
+            dst.offsets = np.array(src.offsets, dtype=float)
+        except Exception:
+            pass
+
+    def _clone_vlrs_non_crs(self, src_header, dst_header, out_version: str, src_pf: int, out_pf: int):
+        try:
+            src_vlrs = list(src_header.vlrs)
+        except Exception:
+            src_vlrs = []
+
+        def is_crs_vlr(vlr) -> bool:
+            try:
+                return (
+                    getattr(vlr, "user_id", "") == "LASF_Projection"
+                    and getattr(vlr, "record_id", None) in (2111, 2112, 34735, 34736, 34737)
+                )
+            except Exception:
+                return False
+
+        def is_copc_vlr(vlr) -> bool:
+            try:
+                uid = str(getattr(vlr, "user_id", "")).strip().lower()
+                desc = str(getattr(vlr, "description", "")).strip().lower()
+                rec = getattr(vlr, "record_id", None)
+                return "copc" in uid or "copc" in desc or (uid == "entwine" and rec == 1)
+            except Exception:
+                return False
+
+        def is_extra_bytes_vlr(vlr) -> bool:
+            try:
+                return getattr(vlr, "user_id", "") == "LASF_Spec" and getattr(vlr, "record_id", None) == 4
+            except Exception:
+                return False
+
+        skipped = 0
+        for vlr in src_vlrs:
+            if is_crs_vlr(vlr) or is_copc_vlr(vlr):
+                skipped += 1
+                continue
+            if out_version == "1.2" and (src_pf != out_pf) and is_extra_bytes_vlr(vlr):
+                skipped += 1
+                continue
+            try:
+                dst_header.vlrs.append(vlr)
+            except Exception:
+                skipped += 1
+
+        if skipped:
+            self.signals.log.emit(f"[{now_stamp()}] VLRs copiados com filtros. Ignorados: {skipped}")
+
+    def _apply_crs(self, src_header, dst_header):
+        try:
+            crs = src_header.parse_crs()
+        except Exception:
+            crs = None
+        if crs is None:
+            return
+        try:
+            dst_header.add_crs(crs, keep_compatibility=True)
+            self.signals.log.emit(f"[{now_stamp()}] CRS preservado via add_crs().")
+        except Exception as e:
+            self.signals.log.emit(f"[{now_stamp()}] Aviso CRS: {e}")
+
+    def _build_output_header(self, src_header) -> Tuple[object, str, int]:
+        src_version = str(src_header.version)
+        src_pf = int(src_header.point_format.id)
+
+        if self.target_version_choice == "KEEP":
+            out_version = src_version
+        else:
+            out_version = self.target_version_choice
+
+        out_pf = src_pf
+        if out_version == "1.2" and src_pf > 3:
+            out_pf = self._choose_pf_for_12(src_header)
+
+        new_hdr = laspy.LasHeader(version=out_version, point_format=out_pf)
+        self._copy_header_fields(src_header, new_hdr)
+        self._apply_crs(src_header, new_hdr)
+        self._clone_vlrs_non_crs(src_header, new_hdr, out_version, src_pf, out_pf)
+
+        if out_version == "1.4":
+            try:
+                evlrs = getattr(src_header, "evlrs", None)
+                if evlrs:
+                    new_hdr.evlrs = [v for v in evlrs if "copc" not in str(getattr(v, "user_id", "")).lower()]
+            except Exception:
+                pass
+
+        return new_hdr, out_version, out_pf
+
+    def _convert_chunk_if_needed(self, input_chunk, buffer_chunk, src_dims: set, dst_dims: set,
+                                 out_version: str) -> Tuple[object, Dict[str, int]]:
+        stats = {
+            "clip_return": 0,
+            "clip_nreturns": 0,
+            "clip_class": 0,
+        }
+
+        n = len(input_chunk)
+        out_chunk = buffer_chunk[:n]
+        out_chunk.copy_fields_from(input_chunk)
+
+        if "scan_angle" in src_dims and "scan_angle_rank" in dst_dims:
+            try:
+                ang = np.asarray(input_chunk["scan_angle"])
+                out_chunk["scan_angle_rank"] = np.clip(np.rint(ang), -90, 90).astype(np.int8)
+            except Exception:
+                pass
+        elif "scan_angle_rank" in src_dims and "scan_angle" in dst_dims:
+            try:
+                ang = np.asarray(input_chunk["scan_angle_rank"], dtype=np.float64)
+                out_chunk["scan_angle"] = np.clip(np.round(ang / 0.006), -30000, 30000).astype(np.int16)
+            except Exception:
+                pass
+
+        if out_version == "1.2":
+            if "return_number" in dst_dims and "return_number" in src_dims:
+                rn = np.asarray(input_chunk["return_number"])
+                c = int(np.count_nonzero(rn > 7))
+                if c:
+                    stats["clip_return"] += c
+                out_chunk["return_number"] = np.minimum(rn, 7).astype(out_chunk["return_number"].dtype)
+
+            if "number_of_returns" in dst_dims and "number_of_returns" in src_dims:
+                nr = np.asarray(input_chunk["number_of_returns"])
+                c = int(np.count_nonzero(nr > 7))
+                if c:
+                    stats["clip_nreturns"] += c
+                out_chunk["number_of_returns"] = np.minimum(nr, 7).astype(out_chunk["number_of_returns"].dtype)
+
+            if "classification" in dst_dims and "classification" in src_dims:
+                cl = np.asarray(input_chunk["classification"])
+                c = int(np.count_nonzero(cl > 31))
+                if c:
+                    stats["clip_class"] += c
+                out_chunk["classification"] = np.minimum(cl, 31).astype(out_chunk["classification"].dtype)
+
+        return out_chunk, stats
+
+    def run(self):
+        results: List[JobResult] = []
+
+        if laspy is None:
+            self.signals.failed.emit("Não consegui importar 'laspy'. Instale com: pip install laspy[lazrs]")
+            self.signals.finished.emit(results)
+            return
+
+        if LazBackend is not None:
+            available = LazBackend.detect_available()
+            if not available:
+                self.signals.failed.emit("Nenhum backend LAZ disponível. Instale: pip install laspy[lazrs]")
+                self.signals.finished.emit(results)
+                return
+
+        laz_backend = self._pick_backend()
+        total_files = len(self.jobs)
+        done_files = 0
+
+        self.signals.log.emit(f"[{now_stamp()}] Iniciando conversão de {total_files} arquivo(s).")
+        if LazBackend is not None:
+            self.signals.log.emit(f"[{now_stamp()}] Backends disponíveis: {LazBackend.detect_available()}")
+            self.signals.log.emit(f"[{now_stamp()}] Backend selecionado: {self.backend_choice} -> {laz_backend}")
+        self.signals.log.emit(f"[{now_stamp()}] Versão de saída: {self.target_version_choice}")
+
+        for job in self.jobs:
+            if self._cancel:
+                self.signals.log.emit(f"[{now_stamp()}] Cancelado pelo usuário.")
+                break
+
+            in_path = job.in_path
+            self.signals.current_file.emit(in_path)
+
+            try:
+                if not os.path.exists(in_path):
+                    raise FileNotFoundError(f"Arquivo não existe: {in_path}")
+
+                ext = os.path.splitext(in_path)[1].lower()
+                if ext not in (".las", ".laz"):
+                    raise ValueError("Entrada inválida. Aceito apenas .las e .laz")
+
+                out_path = self._calc_out_path(job)
+                if not out_path:
+                    raise ValueError("Pasta de saída inválida.")
+
+                if os.path.exists(out_path) and not self.overwrite:
+                    msg = "Saída já existe. Arquivo pulado porque sobrescrever está desligado."
+                    result = JobResult(in_path, out_path, True, msg)
+                    results.append(result)
+                    self.signals.file_result.emit(result)
+                    done_files += 1
+                    self.signals.overall.emit(done_files, total_files)
+                    self.signals.file_progress.emit(0, 0)
+                    continue
+
+                safe_makedirs(os.path.dirname(out_path))
+                t0 = time.time()
+                in_size = os.path.getsize(in_path)
+
+                with laspy.open(in_path, mode="r", read_evlrs=self.read_evlrs, laz_backend=laz_backend) as reader:
+                    src_header = reader.header
+                    total_points = int(getattr(src_header, "point_count", 0) or 0)
+                    src_version = str(src_header.version)
+                    src_pf = int(src_header.point_format.id)
+
+                    self.signals.log.emit(f"[{now_stamp()}] Lendo: {in_path} | {self._header_summary(src_header)}")
+
+                    out_header, out_version, out_pf = self._build_output_header(src_header)
+                    if out_version == "1.2" and src_version == "1.4" and src_pf >= 6:
+                        self.signals.log.emit(
+                            f"[{now_stamp()}] Downgrade detectado: v{src_version}/PF{src_pf} -> v{out_version}/PF{out_pf}"
+                        )
+                    elif out_version == "1.4" and src_version in ("1.2", "1.3") and src_pf <= 3:
+                        self.signals.log.emit(
+                            f"[{now_stamp()}] Upgrade detectado: v{src_version}/PF{src_pf} -> v{out_version}/PF{out_pf}"
+                        )
+
+                    src_dims = set(src_header.point_format.dimension_names)
+                    dst_dims = set(out_header.point_format.dimension_names)
+                    need_pf_convert = (src_pf != out_pf)
+
+                    is_out_laz = out_path.lower().endswith(".laz")
+                    writer_kw = {
+                        "mode": "w",
+                        "header": out_header,
+                    }
+                    if is_out_laz:
+                        writer_kw["do_compress"] = True
+                        if laz_backend is not None:
+                            writer_kw["laz_backend"] = laz_backend
+
+                    with laspy.open(out_path, **writer_kw) as writer:
+                        done_pts = 0
+                        if total_points <= 0:
+                            self.signals.file_progress.emit(0, 0)
+                        else:
+                            self.signals.file_progress.emit(0, total_points)
+
+                        if need_pf_convert:
+                            buffer_chunk = laspy.PackedPointRecord.zeros(
+                                point_count=self.chunk_points,
+                                point_format=out_header.point_format,
+                            )
+                            agg = {"clip_return": 0, "clip_nreturns": 0, "clip_class": 0}
+
+                            for input_chunk in reader.chunk_iterator(self.chunk_points):
+                                if self._cancel:
+                                    raise RuntimeError("Cancelado durante a escrita.")
+
+                                out_chunk, st = self._convert_chunk_if_needed(
+                                    input_chunk, buffer_chunk, src_dims, dst_dims, out_version
+                                )
+                                agg["clip_return"] += st["clip_return"]
+                                agg["clip_nreturns"] += st["clip_nreturns"]
+                                agg["clip_class"] += st["clip_class"]
+                                writer.write_points(out_chunk)
+                                done_pts += len(input_chunk)
+                                self.signals.file_progress.emit(done_pts, total_points)
+
+                            if out_version == "1.2" and any(agg.values()):
+                                self.signals.log.emit(
+                                    f"[{now_stamp()}] Ajustes 1.2 | return>{agg['clip_return']} | nreturns>{agg['clip_nreturns']} | class>{agg['clip_class']}"
+                                )
+                        else:
+                            for points in reader.chunk_iterator(self.chunk_points):
+                                if self._cancel:
+                                    raise RuntimeError("Cancelado durante a escrita.")
+                                writer.write_points(points)
+                                done_pts += len(points)
+                                self.signals.file_progress.emit(done_pts, total_points)
+
+                out_size = os.path.getsize(out_path)
+                secs = time.time() - t0
+
+                if self.verify:
+                    chk_kw = {"mode": "r", "read_evlrs": self.read_evlrs}
+                    if is_out_laz and laz_backend is not None:
+                        chk_kw["laz_backend"] = laz_backend
+                    with laspy.open(out_path, **chk_kw) as chk:
+                        out_pts = int(getattr(chk.header, "point_count", -1))
+                    if total_points >= 0 and out_pts != total_points:
+                        raise RuntimeError(f"Verificação falhou: saída={out_pts} pontos | entrada={total_points} pontos")
+
+                if self.move_original:
+                    orig_dir = os.path.dirname(in_path)
+                    stash = os.path.join(orig_dir, "_LAS_ORIG")
+                    safe_makedirs(stash)
+                    dst = os.path.join(stash, os.path.basename(in_path))
+                    if os.path.abspath(dst) != os.path.abspath(in_path):
+                        if os.path.exists(dst):
+                            base, ext0 = os.path.splitext(dst)
+                            dst = f"{base}_{int(time.time())}{ext0}"
+                        shutil.move(in_path, dst)
+                        self.signals.log.emit(f"[{now_stamp()}] Original movido para: {dst}")
+
+                savings = ""
+                if in_size and out_size:
+                    pct = (1.0 - (out_size / in_size)) * 100.0
+                    if is_out_laz:
+                        savings = f" | {human_bytes(in_size)} -> {human_bytes(out_size)} ({pct:+.2f}%)"
+                    else:
+                        savings = f" | {human_bytes(in_size)} -> {human_bytes(out_size)} (descomprimido)"
+
+                msg = f"OK em {secs:.1f}s{savings}"
+                self.signals.log.emit(f"[{now_stamp()}] {msg} | {out_path}")
+                result = JobResult(
+                    in_path=in_path,
+                    out_path=out_path,
+                    ok=True,
+                    message=msg,
+                    in_size=in_size,
+                    out_size=out_size,
+                    points=total_points,
+                    seconds=secs,
+                    out_version=out_version,
+                    out_point_format=out_pf,
+                )
+                results.append(result)
+                self.signals.file_result.emit(result)
+
+            except Exception as e:
+                tb = traceback.format_exc()
+                self.signals.log.emit(f"[{now_stamp()}] ERRO: {in_path}\n{e}\n{tb}")
+                out_guess = ""
                 try:
-                    pl.enable_eye_dome_lighting()
+                    out_guess = self._calc_out_path(job)
                 except Exception:
                     pass
-            resumo = f"{len(pts):,} pontos".replace(",", ".")
+                result = JobResult(in_path, out_guess, False, str(e))
+                results.append(result)
+                self.signals.file_result.emit(result)
+
+            done_files += 1
+            self.signals.overall.emit(done_files, total_files)
+            self.signals.file_progress.emit(0, 0)
+
+        self.signals.finished.emit(results)
+
+
+# ----------------------------- aba principal -----------------------------
+
+class SmartLasToLazTab(QWidget):
+    def __init__(self, status=None):
+        super().__init__()
+        self.status_cb = status or (lambda msg: None)
+        self.settings = QSettings("LAS_Toolkit", "ConversorInteligente")
+        self.root_map: Dict[str, Optional[str]] = {}
+        self.results_last: List[JobResult] = []
+        self.file_to_row: Dict[str, int] = {}
+        self.thread: Optional[QThread] = None
+        self.worker: Optional[LasToLazWorker] = None
+        self.signals: Optional[WorkerSignals] = None
+
+        self._build_ui()
+        self.load_settings()
+        self.refresh_out_mode_ui()
+        self.append_log(f"[{now_stamp()}] Aba Conversor LAS → LAZ iniciada.")
+
+        if laspy is None:
+            self.append_log(f"[{now_stamp()}] AVISO: laspy não importou. Instale: pip install laspy[lazrs]")
         else:
-            x, y, z, mask = _carregar_mdt_view(params.paths)
-            zmin = float(z[mask].min())
-            zf = np.where(mask, z, zmin)
-            X, Y = np.meshgrid(x - x.min(), y - y.min())
-            grade = pv.StructuredGrid(X, Y, (zf - zmin) * params.exagero_z)
-            grade["Cota (m)"] = zf.ravel(order="F")
-            if not mask.all():
-                grade["valido"] = mask.ravel(order="F").astype(np.uint8)
-                grade = grade.threshold(0.5, scalars="valido", all_scalars=True)
-            sup = grade.extract_surface().compute_normals(
-                point_normals=True, cell_normals=False, inplace=False)
-            pl.add_mesh(sup, scalars="Cota (m)", cmap=params.cmap,
-                        smooth_shading=True, scalar_bar_args=barra)
-            resumo = f"superfície {z.shape[1]} x {z.shape[0]} células"
-
-        pl.add_axes()
-        pl.view_isometric()
-        fila.put(("log", f"Dados carregados: {resumo}."))
-        if salvar:
-            pl.show(screenshot=params.png_path)
-            fila.put(("ok", f"PNG salvo em: {params.png_path}"))
-        else:
-            fila.put(("log", "Janela 3D aberta (mouse: girar / zoom / mover; feche a janela para terminar)."))
-            pl.show()
-            fila.put(("ok", "Janela 3D fechada."))
-    except Exception:  # noqa: BLE001
-        fila.put(("err", traceback.format_exc()))
-
-
-def work_viewer(params, emit):
-    ctx = multiprocessing.get_context("spawn")
-    fila = ctx.Queue()
-    proc = ctx.Process(target=_viewer_process, args=(params, fila), daemon=True)
-    proc.start()
-    emit("log", "Carregando dados no processo do visualizador...", "")
-    ok = True
-
-    def _drenar():
-        nonlocal ok
-        while True:
             try:
-                tipo, msg = fila.get(timeout=0.3)
+                if LazBackend is not None:
+                    self.append_log(f"[{now_stamp()}] Backends disponíveis: {LazBackend.detect_available()}")
             except Exception:
-                return
-            if tipo == "err":
-                ok = False
-                emit("log", msg, "err")
-            else:
-                emit("log", msg, "ok" if tipo == "ok" else "")
+                pass
 
-    while proc.is_alive():
-        _drenar()
-    _drenar()
-    proc.join()
-    emit("done", ok)
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
 
+        # topo com cards simples
+        top_cards = QHBoxLayout()
+        card_files, self.lbl_count_files = self._make_card("Arquivos na lista", "0")
+        card_ok, self.lbl_count_ok = self._make_card("OK no último run", "0")
+        card_fail, self.lbl_count_fail = self._make_card("Falhas no último run", "0")
+        card_size, self.lbl_est_size = self._make_card("Tamanho estimado", "-")
+        top_cards.addWidget(card_files)
+        top_cards.addWidget(card_ok)
+        top_cards.addWidget(card_fail)
+        top_cards.addWidget(card_size)
+        main_layout.addLayout(top_cards)
 
-class ViewerTab(ToolTab):
-    CORES = ["jet", "turbo", "viridis", "terrain", "gist_earth", "rainbow", "gray"]
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter, 1)
 
-    def __init__(self, status) -> None:
-        super().__init__(status)
-        lay = QVBoxLayout(self)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        splitter.addWidget(left)
 
-        tb = QHBoxLayout()
-        tb.addWidget(mklabel("FONTE (nuvem .las/.laz  ou  MDT .tif):", "sec"))
-        self.btn_add = mkbtn("+ Adicionar", self._add_files)
-        self.btn_dir = mkbtn("Pasta", self._add_folder)
-        self.btn_clr = mkbtn("Limpar", self._clear, "danger")
-        for b in (self.btn_add, self.btn_dir, self.btn_clr):
-            tb.addWidget(b)
-        tb.addStretch(1)
-        lay.addLayout(tb)
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
 
-        lay.addWidget(mklabel(
-            "Arraste arquivos .las/.laz (pontos) OU .tif (superfície) — não misture os dois tipos", "hint"))
-        self.flist = FileList((".las", ".laz", ".tif", ".tiff"))
-        lay.addWidget(self.flist, 1)
+        # grupo arquivos
+        files_box = QGroupBox("Arquivos LAS/LAZ")
+        files_layout = QVBoxLayout(files_box)
 
-        g = QGroupBox("Parâmetros")
-        f = QFormLayout(g)
-        self.edit_classes = QLineEdit("")
-        self.edit_classes.setPlaceholderText("vazio = todas (ex.: 2,6 para solo + edificações)")
-        f.addRow("Classes (só para nuvem):", self.edit_classes)
-        self.spin_ex = spin_d(0.1, 20.0, 1.0, 2, 0.5)
-        f.addRow("Exagero vertical (×):", self.spin_ex)
-        self.spin_pt = spin_d(1.0, 10.0, 2.0, 1, 0.5)
-        f.addRow("Tamanho do ponto (nuvem):", self.spin_pt)
-        self.spin_max = spin_i(1, 200, 10)
-        f.addRow("Máx. de pontos (milhões, nuvem):", self.spin_max)
-        self.combo_cmap = QComboBox()
-        self.combo_cmap.addItems(self.CORES)
-        f.addRow("Rampa de cores (jet = azul→vermelho, como o QTM):", self.combo_cmap)
-        self.combo_fundo = QComboBox()
-        self.combo_fundo.addItems(["black", "white", "darkgray"])
-        f.addRow("Fundo:", self.combo_fundo)
-        self.chk_edl = QCheckBox("Realce de profundidade (Eye-Dome Lighting, nuvem)")
-        self.chk_edl.setChecked(True)
-        f.addRow(self.chk_edl)
-        self.spin_w = spin_i(320, 8000, 1920)
-        self.spin_h = spin_i(240, 8000, 1080)
-        wh = QHBoxLayout()
-        wh.addWidget(self.spin_w)
-        wh.addWidget(mklabel("×"))
-        wh.addWidget(self.spin_h)
-        f.addRow("Tamanho do PNG (px):", wh)
-        lay.addWidget(g)
+        filter_row = QHBoxLayout()
+        self.ed_filter = QLineEdit()
+        self.ed_filter.setPlaceholderText("Filtrar lista por nome, caminho ou extensão...")
+        self.ed_filter.textChanged.connect(self.apply_filter)
+        self.btn_clear_filter = QPushButton("Limpar filtro")
+        self.btn_clear_filter.clicked.connect(lambda: self.ed_filter.setText(""))
+        filter_row.addWidget(self.ed_filter)
+        filter_row.addWidget(self.btn_clear_filter)
+        files_layout.addLayout(filter_row)
 
-        lay.addWidget(mklabel("Log", "hint"))
-        self.log = LogView(90)
-        lay.addWidget(self.log)
+        self.listw = DropListWidget(self)
+        self.listw.itemSelectionChanged.connect(self.update_preview_from_selection)
+        files_layout.addWidget(self.listw)
 
-        bottom = QHBoxLayout()
-        self.btn_png = mkbtn("Salvar PNG...", self._png)
-        self.btn_open = mkbtn("▶  Abrir janela 3D", self._abrir, "primary")
-        bottom.addStretch(1)
-        bottom.addWidget(self.btn_png)
-        bottom.addWidget(self.btn_open)
-        lay.addLayout(bottom)
+        btn_row = QHBoxLayout()
+        self.btn_add_files = QPushButton("+ Adicionar arquivos")
+        self.btn_add_folder = QPushButton("Pasta")
+        self.btn_remove = QPushButton("Remover selecionados")
+        self.btn_clear = QPushButton("Limpar lista")
+        self.btn_add_files.clicked.connect(self.add_files)
+        self.btn_add_folder.clicked.connect(self.add_folder)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_clear.clicked.connect(self.clear_list)
+        btn_row.addWidget(self.btn_add_files)
+        btn_row.addWidget(self.btn_add_folder)
+        btn_row.addWidget(self.btn_remove)
+        btn_row.addWidget(self.btn_clear)
+        files_layout.addLayout(btn_row)
 
-    def _add_files(self) -> None:
-        ps, _ = QFileDialog.getOpenFileNames(
-            self, "Selecionar arquivos", "", "Nuvem / MDT (*.las *.laz *.tif *.tiff)")
-        self._add([Path(p) for p in ps])
+        left_layout.addWidget(files_box)
 
-    def _add_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Selecionar pasta")
-        if d:
-            self._add([Path(d)])
+        # execução
+        run_box = QGroupBox("Execução")
+        run_layout = QGridLayout(run_box)
+        self.lbl_current = QLabel("Arquivo atual: -")
+        self.pb_file = QProgressBar()
+        self.pb_file.setFormat("Arquivo: %p%")
+        self.pb_overall = QProgressBar()
+        self.pb_overall.setFormat("Geral: %p%")
+        self.btn_start = QPushButton("▶  Converter")
+        self.btn_start.setStyleSheet("font-weight: bold;")
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_open_out = QPushButton("Abrir saída")
+        self.btn_start.clicked.connect(self.start_conversion)
+        self.btn_cancel.clicked.connect(self.cancel_conversion)
+        self.btn_open_out.clicked.connect(self.open_output_folder)
+        self.btn_cancel.setEnabled(False)
 
-    def _add(self, paths) -> None:
-        n = self.flist.add_paths(paths)
-        self.status(f"{n} arquivo(s) adicionado(s). Total: {len(self.flist.paths)}.")
+        run_layout.addWidget(self.lbl_current, 0, 0, 1, 3)
+        run_layout.addWidget(self.pb_file, 1, 0, 1, 3)
+        run_layout.addWidget(self.pb_overall, 2, 0, 1, 3)
+        run_layout.addWidget(self.btn_start, 3, 0)
+        run_layout.addWidget(self.btn_cancel, 3, 1)
+        run_layout.addWidget(self.btn_open_out, 3, 2)
+        left_layout.addWidget(run_box)
 
-    def _clear(self) -> None:
-        self.flist.reset_list()
-        self.status("Lista limpa.")
+        # tabela de resultados
+        table_box = QGroupBox("Status por arquivo")
+        table_layout = QVBoxLayout(table_box)
+        self.table = SmartTable()
+        table_layout.addWidget(self.table)
+        left_layout.addWidget(table_box)
 
-    def _montar(self, png_path: str = ""):
-        paths = list(self.flist.paths)
-        if not paths:
-            warn(self, "Atenção", "Adicione arquivos .las/.laz ou .tif.")
-            return None
-        tipos = {"laz" if p.suffix.lower() in (".las", ".laz") else "tif" for p in paths}
-        if len(tipos) > 1:
-            warn(self, "Atenção", "Não misture nuvem (.las/.laz) e MDT (.tif) na mesma lista.")
-            return None
-        fonte = tipos.pop()
-        if fonte == "tif" and not GEO_AVAILABLE:
-            warn(self, "Dependência ausente", f"Leitura de GeoTIFF requer rasterio:\n{GEO_IMPORT_ERROR}")
-            return None
-        if fonte == "laz" and not LASPY_AVAILABLE:
-            warn(self, "Dependência ausente", "Instale o laspy: pip install laspy[lazrs]")
-            return None
-        txt = self.edit_classes.text().strip()
-        classes = parse_classes(txt) if txt else []
-        if classes is None:
-            warn(self, "Atenção", "Classes inválidas. Use números separados por vírgula (ex.: 2,6).")
-            return None
-        return ViewerParams(
-            fonte=fonte,
-            paths=[str(p) for p in paths],
-            classes=classes,
-            exagero_z=self.spin_ex.value(),
-            tamanho_ponto=self.spin_pt.value(),
-            max_pontos=self.spin_max.value() * 1_000_000,
-            cmap=self.combo_cmap.currentText(),
-            fundo=self.combo_fundo.currentText(),
-            eye_dome=self.chk_edl.isChecked(),
-            png_path=png_path,
-            png_w=self.spin_w.value(),
-            png_h=self.spin_h.value(),
+        # logs
+        log_box = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_box)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(5000)
+        log_layout.addWidget(self.log)
+        log_btns = QHBoxLayout()
+        self.btn_clear_log = QPushButton("Limpar log")
+        self.btn_save_log = QPushButton("Salvar log")
+        self.btn_save_report = QPushButton("Salvar relatório CSV")
+        self.btn_clear_log.clicked.connect(self.log.clear)
+        self.btn_save_log.clicked.connect(self.save_log)
+        self.btn_save_report.clicked.connect(self.save_report_from_last_results)
+        log_btns.addWidget(self.btn_clear_log)
+        log_btns.addWidget(self.btn_save_log)
+        log_btns.addWidget(self.btn_save_report)
+        log_layout.addLayout(log_btns)
+        left_layout.addWidget(log_box)
+
+        # configurações
+        cfg_box = QGroupBox("Configurações")
+        cfg = QGridLayout(cfg_box)
+
+        self.cb_out_mode = QComboBox()
+        self.cb_out_mode.addItem("Salvar em uma pasta", "OUT_FOLDER")
+        self.cb_out_mode.addItem("Salvar ao lado do arquivo", "NEXT_TO_INPUT")
+        self.cb_out_mode.currentIndexChanged.connect(self.refresh_out_mode_ui)
+
+        self.ed_out_folder = QLineEdit()
+        self.ed_out_folder.setPlaceholderText("Selecione a pasta de saída...")
+        self.btn_pick_out = QPushButton("...")
+        self.btn_pick_out.clicked.connect(self.pick_out_folder)
+
+        self.ed_subfolder = QLineEdit("LAZ")
+        self.ed_subfolder.setPlaceholderText("Ex.: LAZ")
+
+        self.chk_keep_structure = QCheckBox("Manter estrutura de pastas")
+        self.chk_keep_structure.setChecked(True)
+
+        self.cb_out_format = QComboBox()
+        self.cb_out_format.addItem(".LAZ (Comprimido)", "LAZ")
+        self.cb_out_format.addItem(".LAS (Descomprimido)", "LAS")
+
+        self.cb_out_version = QComboBox()
+        self.cb_out_version.addItem("Manter igual ao arquivo", "KEEP")
+        self.cb_out_version.addItem("LAS 1.4", "1.4")
+        self.cb_out_version.addItem("LAS 1.2", "1.2")
+        self.cb_out_version.setCurrentIndex(1)
+
+        self.cb_backend = QComboBox()
+        self.cb_backend.addItem("Auto (recomendado)", "AUTO")
+        self.cb_backend.addItem("lazrs parallel", "LAZRS_PAR")
+        self.cb_backend.addItem("lazrs single", "LAZRS")
+        self.cb_backend.addItem("laszip", "LASZIP")
+        self.btn_check_backends = QPushButton("Checar backends")
+        self.btn_check_backends.clicked.connect(self.check_backends)
+
+        self.sp_chunk = QSpinBox()
+        self.sp_chunk.setRange(50_000, 50_000_000)
+        self.sp_chunk.setSingleStep(250_000)
+        self.sp_chunk.setValue(2_000_000)
+
+        self.chk_overwrite = QCheckBox("Sobrescrever se existir")
+        self.chk_verify = QCheckBox("Verificar contagem de pontos após converter")
+        self.chk_move_original = QCheckBox("Mover original para _LAS_ORIG após sucesso")
+        self.chk_read_evlrs = QCheckBox("Ler EVLRs (LAS 1.4)")
+        self.chk_verify.setChecked(True)
+        self.chk_read_evlrs.setChecked(True)
+
+        row = 0
+        cfg.addWidget(QLabel("Modo de saída:"), row, 0)
+        cfg.addWidget(self.cb_out_mode, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(QLabel("Pasta de saída:"), row, 0)
+        cfg.addWidget(self.ed_out_folder, row, 1)
+        cfg.addWidget(self.btn_pick_out, row, 2)
+        row += 1
+        cfg.addWidget(QLabel("Subpasta (modo ao lado):"), row, 0)
+        cfg.addWidget(self.ed_subfolder, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(self.chk_keep_structure, row, 0, 1, 3)
+        row += 1
+        cfg.addWidget(QLabel("Formato de saída:"), row, 0)
+        cfg.addWidget(self.cb_out_format, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(QLabel("Versão LAS de saída:"), row, 0)
+        cfg.addWidget(self.cb_out_version, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(QLabel("Backend LAZ:"), row, 0)
+        cfg.addWidget(self.cb_backend, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(self.btn_check_backends, row, 0, 1, 3)
+        row += 1
+        cfg.addWidget(QLabel("Chunk (pontos):"), row, 0)
+        cfg.addWidget(self.sp_chunk, row, 1, 1, 2)
+        row += 1
+        cfg.addWidget(self.chk_overwrite, row, 0, 1, 3)
+        row += 1
+        cfg.addWidget(self.chk_verify, row, 0, 1, 3)
+        row += 1
+        cfg.addWidget(self.chk_move_original, row, 0, 1, 3)
+        row += 1
+        cfg.addWidget(self.chk_read_evlrs, row, 0, 1, 3)
+        right_layout.addWidget(cfg_box)
+
+        # preview
+        prev_box = QGroupBox("Preview do arquivo selecionado")
+        prev_layout = QVBoxLayout(prev_box)
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        prev_layout.addWidget(self.preview)
+        right_layout.addWidget(prev_box, 1)
+
+        tip = QLabel(
+            "Dica: arraste arquivos ou pastas (.las ou .laz) para a lista. Suporta conversão nos dois sentidos: compactar (LAS → LAZ) e descompactar (LAZ → LAS)."
         )
+        tip.setWordWrap(True)
+        tip.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        tip.setStyleSheet("padding:6px; color:#555;")
+        main_layout.addWidget(tip)
 
-    def _iniciar(self, params) -> None:
-        self._busy(True)
-        self.log.add("")
-        self.runner.start(work_viewer, params)
+    def _make_card(self, title: str, value: str):
+        box = QFrame()
+        box.setObjectName("card")
+        box.setFrameShape(QFrame.StyledPanel)
+        box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        box.setStyleSheet("""
+            QFrame#card {
+                border: 1px solid #c8c8c8;
+                border-radius: 8px;
+                background: #fdfdfd;
+                padding: 4px;
+            }
+        """)
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 8, 10, 8)
 
-    def _abrir(self) -> None:
-        params = self._montar()
-        if params:
-            self._iniciar(params)
+        lbl_title = QLabel(title, box)
+        lbl_title.setStyleSheet("color: #666; font-size: 11px;")
 
-    def _png(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Salvar imagem", "", "PNG (*.png)")
+        lbl_value = QLabel(value, box)
+        lbl_value.setStyleSheet("font-size: 20px; font-weight: bold;")
+
+        lay.addWidget(lbl_title)
+        lay.addWidget(lbl_value)
+        return box, lbl_value
+
+    # ---------------------- persistência ----------------------
+
+    def save_settings(self):
+        try:
+            self.settings.setValue("out_mode", self.cb_out_mode.currentIndex())
+            self.settings.setValue("out_folder", self.ed_out_folder.text().strip())
+            self.settings.setValue("subfolder", self.ed_subfolder.text().strip())
+            self.settings.setValue("keep_structure", self.chk_keep_structure.isChecked())
+            self.settings.setValue("out_format", self.cb_out_format.currentIndex())
+            self.settings.setValue("out_version", self.cb_out_version.currentIndex())
+            self.settings.setValue("backend", self.cb_backend.currentIndex())
+            self.settings.setValue("chunk", self.sp_chunk.value())
+            self.settings.setValue("overwrite", self.chk_overwrite.isChecked())
+            self.settings.setValue("verify", self.chk_verify.isChecked())
+            self.settings.setValue("move_original", self.chk_move_original.isChecked())
+            self.settings.setValue("read_evlrs", self.chk_read_evlrs.isChecked())
+        except Exception:
+            pass
+
+    def load_settings(self):
+        try:
+            self.cb_out_mode.setCurrentIndex(safe_int(self.settings.value("out_mode", 0)))
+            self.ed_out_folder.setText(str(self.settings.value("out_folder", "")))
+            self.ed_subfolder.setText(str(self.settings.value("subfolder", "LAZ")))
+            self.chk_keep_structure.setChecked(str(self.settings.value("keep_structure", "true")).lower() == "true")
+            self.cb_out_format.setCurrentIndex(safe_int(self.settings.value("out_format", 0)))
+            self.cb_out_version.setCurrentIndex(safe_int(self.settings.value("out_version", 1)))
+            self.cb_backend.setCurrentIndex(safe_int(self.settings.value("backend", 0)))
+            self.sp_chunk.setValue(safe_int(self.settings.value("chunk", 2000000), 2000000))
+            self.chk_overwrite.setChecked(str(self.settings.value("overwrite", "false")).lower() == "true")
+            self.chk_verify.setChecked(str(self.settings.value("verify", "true")).lower() == "true")
+            self.chk_move_original.setChecked(str(self.settings.value("move_original", "false")).lower() == "true")
+            self.chk_read_evlrs.setChecked(str(self.settings.value("read_evlrs", "true")).lower() == "true")
+        except Exception:
+            pass
+
+    # ---------------------- helpers UI ----------------------
+
+    def append_log(self, txt: str):
+        self.log.appendPlainText(txt)
+        cursor = self.log.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.log.setTextCursor(cursor)
+
+    def refresh_out_mode_ui(self):
+        mode = self.cb_out_mode.currentData()
+        is_out_folder = mode == "OUT_FOLDER"
+        self.ed_out_folder.setEnabled(is_out_folder)
+        self.btn_pick_out.setEnabled(is_out_folder)
+        self.chk_keep_structure.setEnabled(is_out_folder)
+        self.ed_subfolder.setEnabled(not is_out_folder)
+
+    def pick_out_folder(self):
+        d = QFileDialog.getExistingDirectory(self, "Selecione a pasta de saída")
+        if d:
+            self.ed_out_folder.setText(d)
+
+    def open_output_folder(self):
+        mode = self.cb_out_mode.currentData()
+        if mode == "OUT_FOLDER":
+            out = self.ed_out_folder.text().strip()
+            if out and os.path.isdir(out):
+                open_in_file_manager(out)
+                return
+            QMessageBox.information(self, "Saída", "Selecione uma pasta de saída válida.")
+            return
+
+        if self.listw.count() == 0:
+            QMessageBox.information(self, "Saída", "Sem arquivos na lista.")
+            return
+
+        p = self.listw.item(0).data(Qt.UserRole)
+        if p and os.path.exists(p):
+            out_dir = os.path.dirname(p)
+            sub = self.ed_subfolder.text().strip()
+            if sub:
+                out_dir = os.path.join(out_dir, sub)
+            safe_makedirs(out_dir)
+            open_in_file_manager(out_dir)
+
+    def update_cards(self):
+        self.lbl_count_files.setText(str(self.listw.count()))
+        ok = sum(1 for r in self.results_last if r.ok)
+        fail = sum(1 for r in self.results_last if not r.ok)
+        self.lbl_count_ok.setText(str(ok))
+        self.lbl_count_fail.setText(str(fail))
+
+        total = 0
+        for i in range(self.listw.count()):
+            p = self.listw.item(i).data(Qt.UserRole)
+            if p and os.path.exists(p):
+                try:
+                    total += os.path.getsize(p)
+                except Exception:
+                    pass
+        self.lbl_est_size.setText(human_bytes(total) if total else "-")
+
+    def apply_filter(self, text: str):
+        text = (text or "").strip().lower()
+        for i in range(self.listw.count()):
+            item = self.listw.item(i)
+            raw = item.data(Qt.UserRole) or ""
+            item.setHidden(text not in raw.lower())
+
+    # ---------------------- lista ----------------------
+
+    def handle_dropped_paths(self, paths: List[str]):
+        total_added = 0
+        for p in paths:
+            if os.path.isdir(p):
+                total_added += self._add_folder_internal(p, silent=True)
+            else:
+                if self._add_file_internal(p, root_for_rel=os.path.dirname(p), silent=True):
+                    total_added += 1
+        self.append_log(f"[{now_stamp()}] Drag&drop concluído. Adicionados: {total_added}")
+        self.update_cards()
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Selecione arquivos LAS/LAZ",
+            "",
+            "LAS/LAZ (*.las *.laz *.LAS *.LAZ)"
+        )
+        added = 0
+        for f in files:
+            if self._add_file_internal(f, root_for_rel=os.path.dirname(f), silent=True):
+                added += 1
+        self.append_log(f"[{now_stamp()}] Arquivos adicionados: {added}")
+        self.update_cards()
+
+    def add_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Selecione a pasta com LAS/LAZ")
+        if folder:
+            added = self._add_folder_internal(folder)
+            self.append_log(f"[{now_stamp()}] Pasta adicionada: {folder} | {added} arquivo(s)")
+            self.update_cards()
+
+    def _add_folder_internal(self, folder: str, silent: bool = False) -> int:
+        added = 0
+        for root, _, files in os.walk(folder):
+            for fn in files:
+                if fn.lower().endswith((".las", ".laz")):
+                    p = os.path.join(root, fn)
+                    if self._add_file_internal(p, root_for_rel=folder, silent=True):
+                        added += 1
+        if not silent:
+            self.append_log(f"[{now_stamp()}] Pasta adicionada: {folder} | {added} arquivo(s)")
+        return added
+
+    def _add_file_internal(self, path: str, root_for_rel: Optional[str], silent: bool = False) -> bool:
+        if not path.lower().endswith((".las", ".laz")):
+            return False
+        path = os.path.abspath(path)
+        if path in self.root_map:
+            return False
+
+        item = QListWidgetItem(path)
+        item.setData(Qt.UserRole, path)
+        item.setData(Qt.UserRole + 1, root_for_rel)
+        self.listw.addItem(item)
+        self.root_map[path] = root_for_rel
+        self._ensure_table_row(path)
+        if not silent:
+            self.append_log(f"[{now_stamp()}] Adicionado: {path}")
+        return True
+
+    def remove_selected(self):
+        selected_paths = []
+        for it in self.listw.selectedItems():
+            p = it.data(Qt.UserRole)
+            selected_paths.append(p)
+        for p in selected_paths:
+            self._remove_path(p)
+        self.preview.clear()
+        self.update_cards()
+
+    def _remove_path(self, path: str):
+        for i in range(self.listw.count() - 1, -1, -1):
+            item = self.listw.item(i)
+            if item.data(Qt.UserRole) == path:
+                self.listw.takeItem(i)
+                break
+        self.root_map.pop(path, None)
+        self.rebuild_table_from_list()
+
+    def clear_list(self):
+        self.listw.clear()
+        self.root_map.clear()
+        self.preview.clear()
+        self.table.setRowCount(0)
+        self.file_to_row.clear()
+        self.update_cards()
+
+    # ---------------------- tabela ----------------------
+
+    def rebuild_table_from_list(self):
+        self.table.setRowCount(0)
+        self.file_to_row.clear()
+        for i in range(self.listw.count()):
+            path = self.listw.item(i).data(Qt.UserRole)
+            self._ensure_table_row(path)
+
+    def _ensure_table_row(self, path: str):
+        if path in self.file_to_row:
+            return self.file_to_row[path]
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.file_to_row[path] = row
+        self._set_table_item(row, 0, "Na fila")
+        self._set_table_item(row, 1, path)
+        self._set_table_item(row, 2, "-")
+        self._set_table_item(row, 3, "-")
+        self._set_table_item(row, 4, "-")
+        self._set_table_item(row, 5, "Aguardando")
+        return row
+
+    def _set_table_item(self, row: int, col: int, text: str, color: Optional[QColor] = None):
+        item = self.table.item(row, col)
+        if item is None:
+            item = QTableWidgetItem()
+            self.table.setItem(row, col, item)
+        item.setText(str(text))
+        if color is not None:
+            item.setForeground(color)
+
+    def on_file_result(self, result: JobResult):
+        row = self._ensure_table_row(result.in_path)
+        status_text = "OK" if result.ok else "ERRO"
+        status_color = QColor("green") if result.ok else QColor("red")
+        self._set_table_item(row, 0, status_text, status_color)
+        self._set_table_item(row, 1, result.in_path)
+        self._set_table_item(row, 2, str(result.points) if result.points is not None else "-")
+        ver_text = "-"
+        if result.out_version is not None and result.out_point_format is not None:
+            ver_text = f"v{result.out_version} / PF{result.out_point_format}"
+        self._set_table_item(row, 3, ver_text)
+        self._set_table_item(row, 4, result.out_path or "-")
+        self._set_table_item(row, 5, result.message)
+
+    # ---------------------- preview ----------------------
+
+    def update_preview_from_selection(self):
+        items = self.listw.selectedItems()
+        if not items:
+            self.preview.clear()
+            return
+        path = items[0].data(Qt.UserRole)
+        self.preview.setPlainText(self.build_preview(path))
+
+    def build_preview(self, path: str) -> str:
+        if laspy is None:
+            return "laspy não está instalado."
+        if not os.path.exists(path):
+            return "Arquivo não existe."
+        try:
+            s = os.path.getsize(path)
+            with laspy.open(path, mode="r", read_evlrs=self.chk_read_evlrs.isChecked()) as r:
+                h = r.header
+                info = []
+                info.append(f"Arquivo: {path}")
+                info.append(f"Tamanho: {human_bytes(s)}")
+                info.append(f"Versão LAS: {h.version}")
+                info.append(f"Point format: {h.point_format.id}")
+                info.append(f"Qtd. pontos: {h.point_count}")
+                try:
+                    info.append(f"Scales: {list(h.scales)}")
+                    info.append(f"Offsets: {list(h.offsets)}")
+                except Exception:
+                    pass
+                try:
+                    mins = h.mins
+                    maxs = h.maxs
+                    info.append(f"Bounds mín.: ({mins[0]:.3f}, {mins[1]:.3f}, {mins[2]:.3f})")
+                    info.append(f"Bounds máx.: ({maxs[0]:.3f}, {maxs[1]:.3f}, {maxs[2]:.3f})")
+                except Exception:
+                    pass
+                try:
+                    crs = h.parse_crs()
+                    if crs:
+                        info.append(f"CRS: {crs.to_string()}")
+                    else:
+                        info.append("CRS: não identificado")
+                except Exception:
+                    info.append("CRS: não disponível")
+                try:
+                    dims = list(h.point_format.dimension_names)
+                    info.append("Dimensões: " + ", ".join(map(str, dims)))
+                except Exception:
+                    pass
+                try:
+                    info.append(f"VLRs: {len(h.vlrs)}")
+                except Exception:
+                    pass
+                try:
+                    evlrs = getattr(h, "evlrs", None)
+                    if evlrs is not None:
+                        info.append(f"EVLRs: {len(evlrs)}")
+                except Exception:
+                    pass
+            return "\n".join(info)
+        except Exception as e:
+            return f"Erro ao ler o header:\n{e}\n\n{traceback.format_exc()}"
+
+    # ---------------------- backends ----------------------
+
+    def check_backends(self):
+        if laspy is None or LazBackend is None:
+            QMessageBox.warning(self, "Backends", "laspy não está disponível.")
+            return
+        try:
+            av = LazBackend.detect_available()
+            QMessageBox.information(self, "Backends LAZ", f"Disponíveis agora:\n{av}")
+        except Exception as e:
+            QMessageBox.warning(self, "Backends", f"Erro checando backends:\n{e}")
+
+    # ---------------------- execução ----------------------
+
+    def _collect_jobs(self) -> List[Job]:
+        jobs: List[Job] = []
+        for i in range(self.listw.count()):
+            it = self.listw.item(i)
+            p = it.data(Qt.UserRole)
+            root_for_rel = it.data(Qt.UserRole + 1)
+            jobs.append(Job(in_path=p, root_for_rel=root_for_rel))
+        return jobs
+
+    def start_conversion(self):
+        if self.thread is not None:
+            QMessageBox.information(self, "Processando", "Já existe uma conversão em andamento.")
+            return
+
+        if self.listw.count() == 0:
+            QMessageBox.information(self, "Nada para fazer", "Adicione arquivos .LAS/.LAZ primeiro.")
+            return
+
+        if laspy is None:
+            QMessageBox.critical(self, "Dependência faltando", "Instale: pip install laspy[lazrs]")
+            return
+
+        mode = self.cb_out_mode.currentData()
+        out_folder = self.ed_out_folder.text().strip()
+        if mode == "OUT_FOLDER" and not out_folder:
+            QMessageBox.warning(self, "Saída", "Selecione a pasta de saída.")
+            return
+
+        if self.chk_move_original.isChecked():
+            ok = QMessageBox.question(
+                self,
+                "Confirmação",
+                "Os originais serão movidos para a subpasta _LAS_ORIG após sucesso. Deseja continuar?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ok != QMessageBox.Yes:
+                return
+
+        self.save_settings()
+        self.results_last = []
+        self.rebuild_table_from_list()
+        jobs = self._collect_jobs()
+
+        self.btn_start.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.pb_file.setValue(0)
+        self.pb_overall.setValue(0)
+
+        self.signals = WorkerSignals()
+        self.signals.log.connect(self.append_log)
+        self.signals.overall.connect(self.on_overall_progress)
+        self.signals.file_progress.connect(self.on_file_progress)
+        self.signals.current_file.connect(self.on_current_file)
+        self.signals.file_result.connect(self.on_file_result)
+        self.signals.finished.connect(self.on_finished)
+        self.signals.failed.connect(self.on_failed)
+
+        self.thread = QThread(self)
+        self.worker = LasToLazWorker(
+            jobs=jobs,
+            out_mode=mode,
+            out_folder=out_folder,
+            out_subfolder=self.ed_subfolder.text().strip(),
+            keep_structure=self.chk_keep_structure.isChecked(),
+            overwrite=self.chk_overwrite.isChecked(),
+            verify=self.chk_verify.isChecked(),
+            move_original=self.chk_move_original.isChecked(),
+            chunk_points=int(self.sp_chunk.value()),
+            read_evlrs=self.chk_read_evlrs.isChecked(),
+            backend_choice=self.cb_backend.currentData(),
+            target_version_choice=self.cb_out_version.currentData(),
+            signals=self.signals,
+            out_format=self.cb_out_format.currentData() or "LAZ",
+        )
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.start()
+        self.append_log(f"[{now_stamp()}] Conversão iniciada em segundo plano.")
+
+    def cancel_conversion(self):
+        if self.worker:
+            self.worker.cancel()
+            self.append_log(f"[{now_stamp()}] Cancelamento solicitado...")
+
+    def on_current_file(self, path: str):
+        self.lbl_current.setText(f"Arquivo atual: {os.path.basename(path)}")
+        self.status_cb(f"Processando: {os.path.basename(path)}")
+        row = self._ensure_table_row(path)
+        self._set_table_item(row, 0, "Processando")
+        self._set_table_item(row, 5, "Em processamento...")
+
+    def on_file_progress(self, done: int, total: int):
+        if total <= 0:
+            self.pb_file.setValue(0)
+            return
+        pct = int((done / total) * 100)
+        self.pb_file.setValue(max(0, min(100, pct)))
+
+    def on_overall_progress(self, done_files: int, total_files: int):
+        if total_files <= 0:
+            self.pb_overall.setValue(0)
+            return
+        pct = int((done_files / total_files) * 100)
+        self.pb_overall.setValue(max(0, min(100, pct)))
+
+    def on_failed(self, msg: str):
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait(1500)
+        self.thread = None
+        self.worker = None
+        self.signals = None
+        self.append_log(f"[{now_stamp()}] FALHA: {msg}")
+        QMessageBox.critical(self, "Falha", msg)
+
+    def on_finished(self, results: list):
+        self.results_last = results or []
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.pb_file.setValue(0)
+
+        if self.thread is not None:
+            self.thread.quit()
+            self.thread.wait(1500)
+        self.thread = None
+        self.worker = None
+        self.signals = None
+
+        ok = sum(1 for r in self.results_last if r.ok)
+        fail = sum(1 for r in self.results_last if not r.ok)
+        self.append_log(f"[{now_stamp()}] Finalizado. OK={ok} | ERRO={fail}")
+        self.status_cb(f"Conversão concluída. {ok} OK, {fail} erro(s).")
+        self.update_cards()
+        QMessageBox.information(self, "Concluído", f"Processamento finalizado.\nOK: {ok}\nErros: {fail}")
+
+    # ---------------------- exportação ----------------------
+
+    def save_log(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Salvar log", "log_las2laz.txt", "TXT (*.txt)")
         if not path:
             return
-        if not path.lower().endswith(".png"):
-            path += ".png"
-        params = self._montar(png_path=path)
-        if params:
-            self._iniciar(params)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.log.toPlainText())
+            QMessageBox.information(self, "Log", f"Salvo em:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Log", f"Erro salvando log:\n{e}")
 
-    def _on_event(self, kind: str, *a) -> None:
-        if kind == "log":
-            self.log.add(a[0], a[1] if len(a) > 1 else "")
-        elif kind == "done":
-            self.status("Visualizador finalizado." if a[0] else "Visualizador terminou com erro (veja o log).")
+    def save_report_from_last_results(self):
+        if not self.results_last:
+            QMessageBox.information(self, "Relatório", "Ainda não existem resultados. Execute uma conversão primeiro.")
+            return
 
-    def _busy(self, busy: bool) -> None:
-        set_enabled([self.btn_open, self.btn_png, self.btn_add, self.btn_dir, self.btn_clr], not busy)
-        self.btn_open.setText("Visualizando…" if busy else "▶  Abrir janela 3D")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Salvar relatório CSV",
+            f"relatorio_las2laz_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV (*.csv)"
+        )
+        if not path:
+            return
 
-
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow([
+                    "ok", "in_path", "out_path", "out_version", "out_point_format",
+                    "points", "in_size_bytes", "out_size_bytes", "in_size", "out_size",
+                    "delta_bytes", "delta_pct", "seconds", "message"
+                ])
+                for r in self.results_last:
+                    inb = r.in_size if r.in_size is not None else ""
+                    outb = r.out_size if r.out_size is not None else ""
+                    db = ""
+                    dp = ""
+                    if isinstance(inb, int) and isinstance(outb, int) and inb > 0:
+                        db = outb - inb
+                        dp = (outb / inb - 1.0) * 100.0
+                    w.writerow([
+                        1 if r.ok else 0,
+                        r.in_path,
+                        r.out_path,
+                        r.out_version if r.out_version else "",
+                        r.out_point_format if r.out_point_format is not None else "",
+                        r.points if r.points is not None else "",
+                        inb,
+                        outb,
+                        human_bytes(r.in_size) if r.in_size is not None else "",
+                        human_bytes(r.out_size) if r.out_size is not None else "",
+                        db,
+                        f"{dp:.3f}" if dp != "" else "",
+                        f"{r.seconds:.3f}" if r.seconds is not None else "",
+                        r.message,
+                    ])
+            QMessageBox.information(self, "Relatório", f"CSV salvo em:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "Relatório", f"Erro salvando CSV:\n{e}")
 
 # ==========================================================================
 #  JANELA PRINCIPAL
@@ -3812,16 +5169,16 @@ class MainWindow(QMainWindow):
 
         abas = QTabWidget()
         abas.addTab(MetadataTab(status), "Metadados")
-        abas.addTab(RenameTab(status), "Renomear Arquivos")
         abas.addTab(PrjEditTab(status), "Editar PRJ")
         abas.addTab(PrjCopyTab(status), "Copiador PRJ")
         abas.addTab(LowercaseLazTab(status), ".LAZ → .laz")
-        abas.addTab(ConvertVersionTab(status), "Converter LAZ 1.4→1.2")
+        abas.addTab(ConvertVersionTab(status), "Converter Versão (1.4 ↔ 1.2)")
+        abas.addTab(SmartLasToLazTab(status), "Conversor LAS ↔ LAZ")
+        abas.addTab(ExportClassesTab(status), "Exportar Classes")
 
         geo_tabs = (
             (KeyPointsTab, "Pontos-Chave (LAS)"),
             (LatticeTab, "GeoTIFF (Lattice Model)"),
-            (ContoursTab, "Curvas de Nível (Contours)"),
         )
         for cls, titulo in geo_tabs:
             if GEO_AVAILABLE and LASPY_AVAILABLE:
@@ -3837,18 +5194,6 @@ class MainWindow(QMainWindow):
                     ),
                     titulo,
                 )
-        if PYVISTA_AVAILABLE:
-            abas.addTab(ViewerTab(status), "Visualizador 3D")
-        else:
-            abas.addTab(
-                MissingDepsTab(
-                    "Visualizador 3D",
-                    "Dependências ausentes para esta função:\n"
-                    "    No module named 'pyvista'\n\n"
-                    "Instale com:\n    python -m pip install pyvista matplotlib",
-                ),
-                "Visualizador 3D",
-            )
         self.setCentralWidget(abas)
 
 
