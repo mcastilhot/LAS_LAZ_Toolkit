@@ -443,7 +443,53 @@ def _set_raw_classification_byte(las, values):
 
 
 
-def work_convert_version(files, dest_folder, mode, add_suffix, emit):
+def _write_converted_las(convertido, src: Path, dest_folder: str, suffix_tag: str,
+                         add_suffix: bool, overwrite_original: bool) -> Optional[str]:
+    """Grava o LAS/LAZ convertido; se overwrite_original=True, usa arquivo temporário e substitui atomicamente."""
+    if overwrite_original:
+        dest_path = src
+        tmp_path = src.with_name(f".{src.stem}_tmp_conv{src.suffix}")
+        target_write = tmp_path
+    else:
+        nome_saida = src.stem + (suffix_tag if add_suffix else "") + ".laz"
+        dest_path = Path(dest_folder) / nome_saida
+        try:
+            if dest_path.resolve() == src.resolve():
+                return (
+                    f"ignorado — destino coincide com origem "
+                    f"(ative o sufixo {suffix_tag}, marque Sobrescrever original ou escolha outra pasta)"
+                )
+        except Exception:
+            pass
+        target_write = dest_path
+
+    try:
+        laz_bk = None
+        if str(target_write).lower().endswith(".laz") and LazBackend is not None:
+            av = LazBackend.detect_available()
+            laszip_bk = getattr(LazBackend, "Laszip", None)
+            if laszip_bk in av:
+                laz_bk = laszip_bk
+        if laz_bk is not None:
+            convertido.write(str(target_write), laz_backend=laz_bk)
+        else:
+            convertido.write(str(target_write))
+    except NotImplementedError as e:
+        if overwrite_original and target_write.exists():
+            target_write.unlink(missing_ok=True)
+        return f"ignorado — não foi possível gravar: {e}"
+    except Exception:
+        if overwrite_original and target_write.exists():
+            target_write.unlink(missing_ok=True)
+        raise
+
+    if overwrite_original:
+        os.replace(str(tmp_path), str(dest_path))
+
+    return None
+
+
+def work_convert_version(files, dest_folder, mode, add_suffix, overwrite_original, emit):
     """
     Converte arquivos LAS/LAZ entre versões:
       - mode == '1.4->1.2': Downgrade para LAS 1.2 (compatível com softwares legados/TerraScan)
@@ -527,21 +573,9 @@ def work_convert_version(files, dest_folder, mode, add_suffix, emit):
                 if era_copc:
                     _strip_copc(convertido)
 
-                nome_saida = src.stem + ("_v12" if add_suffix else "") + ".laz"
-                dest_path = Path(dest_folder) / nome_saida
-                try:
-                    if dest_path.resolve() == src.resolve():
-                        emit("file", src.name, False, "ignorado — destino coincide com origem (ative o sufixo _v12 ou escolha outra pasta)")
-                        erros += 1
-                        emit("progress", i + 1)
-                        continue
-                except Exception:
-                    pass
-
-                try:
-                    convertido.write(str(dest_path))
-                except NotImplementedError as e:
-                    emit("file", src.name, False, f"ignorado — não foi possível gravar: {e}")
+                erro_msg = _write_converted_las(convertido, src, dest_folder, "_v12", add_suffix, overwrite_original)
+                if erro_msg:
+                    emit("file", src.name, False, erro_msg)
                     erros += 1
                     emit("progress", i + 1)
                     continue
@@ -627,21 +661,9 @@ def work_convert_version(files, dest_folder, mode, add_suffix, emit):
                 if era_copc:
                     _strip_copc(convertido)
 
-                nome_saida = src.stem + ("_v14" if add_suffix else "") + ".laz"
-                dest_path = Path(dest_folder) / nome_saida
-                try:
-                    if dest_path.resolve() == src.resolve():
-                        emit("file", src.name, False, "ignorado — destino coincide com origem (ative o sufixo _v14 ou escolha outra pasta)")
-                        erros += 1
-                        emit("progress", i + 1)
-                        continue
-                except Exception:
-                    pass
-
-                try:
-                    convertido.write(str(dest_path))
-                except NotImplementedError as e:
-                    emit("file", src.name, False, f"ignorado — não foi possível gravar: {e}")
+                erro_msg = _write_converted_las(convertido, src, dest_folder, "_v14", add_suffix, overwrite_original)
+                if erro_msg:
+                    emit("file", src.name, False, erro_msg)
                     erros += 1
                     emit("progress", i + 1)
                     continue
@@ -660,7 +682,7 @@ def work_convert_version(files, dest_folder, mode, add_suffix, emit):
 
 
 def work_downgrade(files, dest_folder, add_suffix, emit):
-    return work_convert_version(files, dest_folder, "1.4->1.2", add_suffix, emit)
+    return work_convert_version(files, dest_folder, "1.4->1.2", add_suffix, False, emit)
 
 # ==========================================================================
 #  EXPORTAR E RECLASSIFICAR CLASSES (macros TerraScan FnScanClassifyClass / FnScanOutput)
@@ -2791,8 +2813,9 @@ class PrjCopyTab(ToolTab):
         if not rows:
             warn(self, "Atenção", "Selecione ao menos um arquivo.")
             return
-        if not self.dest.text():
-            warn(self, "Atenção", "Selecione a pasta de destino.")
+        overwrite = self.chk_overwrite.isChecked()
+        if not overwrite and not self.dest.text():
+            warn(self, "Atenção", "Selecione a pasta de destino ou marque 'Sobrescrever original'.")
             return
         if not ask(self, "Confirmar cópia", f"Copiar {len(rows)} arquivo(s) para:\n{self.dest.text()}?"):
             return
@@ -3007,10 +3030,17 @@ class ConvertVersionTab(ToolTab):
         self.btn_dest = mkbtn("Selecionar pasta", self._pick_dest)
         self.chk = QCheckBox("Adicionar sufixo _v12 ao nome do arquivo")
         self.chk.setChecked(True)
+        self.chk_overwrite = QCheckBox("Sobrescrever original (na pasta de origem)")
+        self.chk_overwrite.setChecked(False)
+        self.chk_overwrite.toggled.connect(self._on_overwrite_toggled)
         r.addWidget(self.dest, 1)
         r.addWidget(self.btn_dest)
         r.addWidget(self.chk)
         ol.addLayout(r)
+        r2 = QHBoxLayout()
+        r2.addWidget(self.chk_overwrite)
+        r2.addStretch(1)
+        ol.addLayout(r2)
         lay.addWidget(opt)
 
         self.stats = Stats([("total", "Total na fila", False), ("ok", "Convertidos", True),
@@ -3031,6 +3061,15 @@ class ConvertVersionTab(ToolTab):
         bottom.addStretch(1)
         bottom.addWidget(self.btn_run)
         lay.addLayout(bottom)
+
+    def _on_overwrite_toggled(self, checked: bool) -> None:
+        self.dest.setEnabled(not checked)
+        self.btn_dest.setEnabled(not checked)
+        self.chk.setEnabled(not checked)
+        if checked:
+            self.dest.setPlaceholderText("Será salvo na pasta de origem sobrescrevendo o arquivo original")
+        else:
+            self.dest.setPlaceholderText("")
 
     def _on_mode_changed(self) -> None:
         if self.rb_downgrade.isChecked():
@@ -3101,7 +3140,7 @@ class ConvertVersionTab(ToolTab):
                 "• Classificação: os valores de classe (inclusive acima de 31) são mantidos, "
                 "gravando o byte completo (como Global Mapper e TerraScan fazem).\n"
                 "• Ângulo de varredura: convertido para graus inteiros (-90° a +90°).\n\n"
-                "Os arquivos de origem não são modificados."
+                + ("ATENÇÃO: Os arquivos originais SERÃO SOBRESCRITOS diretamente na pasta de origem!" if overwrite else "Os arquivos de origem não são modificados.")
             )
         else:
             msg = (
@@ -3111,7 +3150,7 @@ class ConvertVersionTab(ToolTab):
                 "• Ângulo de varredura: expandido para precisão de 0.006° (int16).\n"
                 "• Classificações originais (inclusive acima de 31) são integralmente mantidas.\n"
                 "• Coordenadas, escalas, offsets e Projeção/CRS são preservados.\n\n"
-                "Os arquivos de origem não são modificados."
+                + ("ATENÇÃO: Os arquivos originais SERÃO SOBRESCRITOS diretamente na pasta de origem!" if overwrite else "Os arquivos de origem não são modificados.")
             )
 
         if not ask(self, "Confirmar conversão", msg):
@@ -3128,6 +3167,7 @@ class ConvertVersionTab(ToolTab):
             self.dest.text(),
             mode,
             self.chk.isChecked(),
+            overwrite,
         )
 
     def _on_event(self, kind: str, *a) -> None:
@@ -3949,6 +3989,9 @@ class LasToLazWorker(QObject):
             return None
         available = LazBackend.detect_available()
         if self.backend_choice == "AUTO":
+            laszip_bk = getattr(LazBackend, "Laszip", None)
+            if laszip_bk in available:
+                return laszip_bk
             return None
         mapping = {
             "LAZRS_PAR": getattr(LazBackend, "LazrsParallel", None),
@@ -4538,17 +4581,17 @@ class SmartLasToLazTab(QWidget):
         self.cb_out_version.setCurrentIndex(1)
 
         self.cb_backend = QComboBox()
-        self.cb_backend.addItem("Auto (recomendado)", "AUTO")
-        self.cb_backend.addItem("lazrs parallel", "LAZRS_PAR")
+        self.cb_backend.addItem("Auto (compatível V8i / laszip)", "AUTO")
+        self.cb_backend.addItem("laszip (oficial C++ / V8i)", "LASZIP")
+        self.cb_backend.addItem("lazrs parallel (mais rápido)", "LAZRS_PAR")
         self.cb_backend.addItem("lazrs single", "LAZRS")
-        self.cb_backend.addItem("laszip", "LASZIP")
         self.btn_check_backends = QPushButton("Checar backends")
         self.btn_check_backends.clicked.connect(self.check_backends)
 
         self.sp_chunk = QSpinBox()
         self.sp_chunk.setRange(50_000, 50_000_000)
-        self.sp_chunk.setSingleStep(250_000)
-        self.sp_chunk.setValue(2_000_000)
+        self.sp_chunk.setSingleStep(50_000)
+        self.sp_chunk.setValue(50_000)
 
         self.chk_overwrite = QCheckBox("Sobrescrever se existir")
         self.chk_verify = QCheckBox("Verificar contagem de pontos após converter")
@@ -4646,7 +4689,7 @@ class SmartLasToLazTab(QWidget):
             self.settings.setValue("out_format", self.cb_out_format.currentIndex())
             self.settings.setValue("out_version", self.cb_out_version.currentIndex())
             self.settings.setValue("backend", self.cb_backend.currentIndex())
-            self.settings.setValue("chunk", self.sp_chunk.value())
+            self.settings.setValue("chunk_v2", self.sp_chunk.value())
             self.settings.setValue("overwrite", self.chk_overwrite.isChecked())
             self.settings.setValue("verify", self.chk_verify.isChecked())
             self.settings.setValue("move_original", self.chk_move_original.isChecked())
@@ -4663,7 +4706,7 @@ class SmartLasToLazTab(QWidget):
             self.cb_out_format.setCurrentIndex(safe_int(self.settings.value("out_format", 0)))
             self.cb_out_version.setCurrentIndex(safe_int(self.settings.value("out_version", 1)))
             self.cb_backend.setCurrentIndex(safe_int(self.settings.value("backend", 0)))
-            self.sp_chunk.setValue(safe_int(self.settings.value("chunk", 2000000), 2000000))
+            self.sp_chunk.setValue(safe_int(self.settings.value("chunk_v2", 50000), 50000))
             self.chk_overwrite.setChecked(str(self.settings.value("overwrite", "false")).lower() == "true")
             self.chk_verify.setChecked(str(self.settings.value("verify", "true")).lower() == "true")
             self.chk_move_original.setChecked(str(self.settings.value("move_original", "false")).lower() == "true")

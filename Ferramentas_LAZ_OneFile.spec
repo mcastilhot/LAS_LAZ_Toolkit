@@ -11,6 +11,7 @@ all_hiddenimports = [
     'unittest.mock',
     'numpy.testing',
     'lazrs',
+    'laszip',
     'laspy',
     'scipy',
     'scipy.spatial',
@@ -45,6 +46,7 @@ pacotes = [
     'skimage',
     'laspy',
     'lazrs',
+    'laszip',
     'geopandas',
 ]
 

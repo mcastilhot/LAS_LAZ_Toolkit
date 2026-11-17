@@ -10,6 +10,7 @@ all_hiddenimports = [
     'unittest.mock',
     'numpy.testing',
     'lazrs',
+    'laszip',
     'laspy',
     'scipy',
     'scipy.spatial',
@@ -38,6 +39,7 @@ pacotes = [
     'shapely',
     'laspy',
     'lazrs',
+    'laszip',
 ]
 
 for pkg in pacotes:
