@@ -2813,9 +2813,8 @@ class PrjCopyTab(ToolTab):
         if not rows:
             warn(self, "Atenção", "Selecione ao menos um arquivo.")
             return
-        overwrite = self.chk_overwrite.isChecked()
-        if not overwrite and not self.dest.text():
-            warn(self, "Atenção", "Selecione a pasta de destino ou marque 'Sobrescrever original'.")
+        if not self.dest.text():
+            warn(self, "Atenção", "Selecione a pasta de destino.")
             return
         if not ask(self, "Confirmar cópia", f"Copiar {len(rows)} arquivo(s) para:\n{self.dest.text()}?"):
             return
@@ -3122,8 +3121,9 @@ class ConvertVersionTab(ToolTab):
         if not self.flist.paths:
             info(self, "Nada a fazer", "Adicione arquivos LAZ/LAS para conversão.")
             return
-        if not self.dest.text():
-            warn(self, "Atenção", "Selecione a pasta de destino.")
+        overwrite = self.chk_overwrite.isChecked()
+        if not overwrite and not self.dest.text():
+            warn(self, "Atenção", "Selecione a pasta de destino ou marque 'Sobrescrever original'.")
             return
 
         is_downgrade = self.rb_downgrade.isChecked()
